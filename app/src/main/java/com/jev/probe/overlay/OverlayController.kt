@@ -67,7 +67,9 @@ class OverlayController(private val ctx: Context) {
     var onOcrCapture: (() -> Unit)? = null
 
     /** Scroll upward and seed the selected contact's local history. */
-    var onImportHistory: (() -> Unit)? = null
+    var onImportHistory: ((String) -> Unit)? = null
+    var onEnvironmentSelected: ((String) -> Unit)? = null
+    var onHistorySetup: (() -> Unit)? = null
     var onStopImportHistory: (() -> Unit)? = null
 
     /** Long-press menu action for turning the master switch off. */
@@ -91,6 +93,11 @@ class OverlayController(private val ctx: Context) {
     private var selectedContact: Contact? = null
     private var selectedHistory: List<LogEntry> = emptyList()
     private var historyImportRunning = false
+    private var selectedEnvironment: String? = null
+    private var historyPanelVisible = false
+    private var historyImportStatus: String? = null
+
+    fun blocksAutoAnalysis(): Boolean = historyPanelVisible || choosingContact
 
     /** Whether the overlay window is currently on screen. */
     fun isShowing(): Boolean = root != null
@@ -257,7 +264,7 @@ class OverlayController(private val ctx: Context) {
             layoutParams = FrameLayout.LayoutParams(dp(196), ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(56) }
         }
         menu.addView(menuItem("截屏识别一次") { root?.removeView(menu); onOcrCapture?.invoke() })
-        menu.addView(menuItem("预采集过去的历史") { root?.removeView(menu); onImportHistory?.invoke() })
+        menu.addView(menuItem("预加载历史记录") { root?.removeView(menu); onHistorySetup?.invoke() })
         menu.addView(menuItem("把当前会话存为联系人") { onSaveContact?.invoke(); root?.removeView(menu) })
         menu.addView(menuItem("打开设置") { openSettings(); root?.removeView(menu) })
         menu.addView(menuItem("关闭 GalMagan") { root?.removeView(menu); onDisable?.invoke() })
@@ -306,6 +313,7 @@ class OverlayController(private val ctx: Context) {
     // ------------------------------------------------------------ public API
 
     fun showIdle(title: String?, continuation: Boolean = false) {
+        if (blocksAutoAnalysis()) return
         setConversationInfo(title, continuation)
         ensureRoot(); bubble?.alpha = 0.55f
         // Either there is genuinely nothing to show yet, or the panel is empty
@@ -351,6 +359,7 @@ class OverlayController(private val ctx: Context) {
     }
 
     fun showLoading() {
+        historyPanelVisible = false
         ensureRoot(); bubble?.alpha = 1f
         resetBubbleColor()
         ctxNotes = 0; ctxHistory = 0; ctxStyle = 0 // counts for the round that is starting
@@ -385,10 +394,13 @@ class OverlayController(private val ctx: Context) {
     }
 
     /** Show the selected contact's local history before any analysis starts. */
-    fun showContactHistory(contact: Contact, history: List<LogEntry>) {
+    fun showContactHistory(contact: Contact, history: List<LogEntry>, environment: String) {
         selectedContact = contact
         selectedHistory = history
         historyImportRunning = false
+        selectedEnvironment = environment
+        historyPanelVisible = true
+        historyImportStatus = null
         choosingContact = false
         setConversationInfo(contact.name, false)
         ensureRoot()
@@ -398,6 +410,8 @@ class OverlayController(private val ctx: Context) {
 
     /** Show the one-off analysis mode without binding this chat to a contact. */
     fun showDefaultContext(title: String?) {
+        historyPanelVisible = false
+        selectedEnvironment = null
         selectedContact = null
         selectedHistory = emptyList()
         historyImportRunning = false
@@ -408,35 +422,68 @@ class OverlayController(private val ctx: Context) {
         if (!expanded) toggle()
     }
 
-    fun setHistoryImportProgress(contact: Contact, history: List<LogEntry>, pages: Int, running: Boolean) {
-        selectedContact = contact
-        selectedHistory = history
-        historyImportRunning = running
-        setConversationInfo(contact.name, false)
+    fun showHistorySetup() {
+        choosingContact = true
+        historyPanelVisible = true
         ensureRoot()
-        setContent(captureInfoViews() + contactHistoryViews(pages))
+        setContent(captureInfoViews())
         if (!expanded) toggle()
     }
 
-    private fun contactHistoryViews(pages: Int = 0): List<View> {
+    fun showEnvironmentChooser(contact: Contact) {
+        selectedContact = contact
+        choosingContact = false
+        historyPanelVisible = true
+        historyImportStatus = null
+        setConversationInfo(contact.name, false)
+        ensureRoot()
+        val views = arrayListOf<View>(hint("${contact.name} · 选择聊天环境"))
+        com.jev.probe.core.kb.ChatEnvironment.supported.forEach { environment ->
+            views.add(bigButton(com.jev.probe.core.kb.ChatEnvironment.label(environment)) {
+                onEnvironmentSelected?.invoke(environment)
+            }.apply {
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) }
+            })
+        }
+        views.add(smallAction("重新选择联系人") { showHistorySetup() })
+        setContent(views)
+        if (!expanded) toggle()
+    }
+
+    fun setHistoryImportProgress(contact: Contact, environment: String, history: List<LogEntry>, status: String, running: Boolean) {
+        selectedContact = contact
+        selectedHistory = history
+        historyImportRunning = running
+        selectedEnvironment = environment
+        historyPanelVisible = true
+        choosingContact = false
+        historyImportStatus = status
+        setConversationInfo(contact.name, false)
+        ensureRoot()
+        setContent(captureInfoViews() + contactHistoryViews())
+        if (!expanded) toggle()
+    }
+
+    private fun contactHistoryViews(): List<View> {
         val c = selectedContact ?: return emptyList()
         val latest = selectedHistory.lastOrNull()
         val views = ArrayList<View>()
         views.add(hint("联系人：${c.name}"))
+        views.add(hint("聊天环境：${com.jev.probe.core.kb.ChatEnvironment.label(selectedEnvironment.orEmpty())}"))
         views.add(hint("本地已记录：${selectedHistory.size} 条"))
         views.add(hint(if (latest == null) "最新一条：暂无记录"
             else "最新一条：${if (latest.side == "me") "我" else "对方"}：${latest.text}"))
+        historyImportStatus?.let { views.add(line(it, "#344054", 13f, bold = true)) }
         if (historyImportRunning) {
-            views.add(hint("预加载中：第 $pages 页，已保存 ${selectedHistory.size} 条"))
-            views.add(smallAction("停止预加载") { onStopImportHistory?.invoke() })
+            views.add(smallAction("停止并保存") { onStopImportHistory?.invoke() })
         } else {
-            views.add(smallAction("预加载历史记录") { onImportHistory?.invoke() })
+            views.add(hint("请在所选软件打开该联系人的聊天，先回到最新消息，再开始预加载。"))
+            views.add(smallAction("开始预加载历史记录") { selectedEnvironment?.let { onImportHistory?.invoke(it) } })
+            views.add(smallAction("更换聊天环境") { showEnvironmentChooser(c) })
             views.add(bigButton("分析当前对话") { onManualAnalyze?.invoke() })
         }
-        views.add(smallAction("重新选择联系人") {
-            choosingContact = true
-            setContent(captureInfoViews())
-        })
+        if (!historyImportRunning) views.add(smallAction("重新选择联系人") { showHistorySetup() })
         return views
     }
 
@@ -696,6 +743,7 @@ class OverlayController(private val ctx: Context) {
             if (title == null) "#C24141" else "#344054",
             12f
         ).apply { maxLines = 1; ellipsize = TextUtils.TruncateAt.END }
+        if (historyImportRunning) return listOf(titleView)
         val titleControls = listOf(titleView, smallAction("选择联系人") {
             choosingContact = true
             setContent(captureInfoViews())
@@ -714,7 +762,10 @@ class OverlayController(private val ctx: Context) {
             views.add(contactChoice(contact))
         }
         if (contacts.isEmpty()) views.add(hint("知识库中还没有联系人"))
-        views.add(smallAction("取消") { choosingContact = false; setContent(captureInfoViews()) })
+        views.add(smallAction("取消") {
+            choosingContact = false; historyPanelVisible = false
+            setContent(captureInfoViews() + listOf(bigButton("分析当前对话") { onManualAnalyze?.invoke() }))
+        })
         return views
     }
 

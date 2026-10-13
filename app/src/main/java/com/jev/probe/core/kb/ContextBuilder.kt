@@ -81,9 +81,8 @@ object ContextBuilder {
         if (snapshot.messages.isEmpty()) return null
         val store = KbStore.get(context)
         val contact = store.findContact(snapshot.title.orEmpty(), app) ?: return null
-        val now = System.currentTimeMillis()
         store.appendLog(contact.id, snapshot.messages.map {
-            LogEntry(it.side, it.text, now, app)
+            LogEntry(it.side, it.text, 0L, app)
         })
         return contact
     }
@@ -114,7 +113,7 @@ object ContextBuilder {
         // Filter the widest window FIRST, then take n. The other order lets the
         // messages currently on screen eat into the quota — ask for 30 lines of
         // history, get 30 minus however many are already visible.
-        return store.recentLog(contact.id, KbStore.MAX_LOG)
+        return store.recentLog(contact.id, KbStore.MAX_LOG, app)
             .filter { (it.side + " " + it.text) !in onScreen }
             .takeLast(n)
     }

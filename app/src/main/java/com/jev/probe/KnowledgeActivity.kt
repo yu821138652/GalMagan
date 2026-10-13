@@ -285,7 +285,13 @@ class KnowledgeActivity : AppCompatActivity() {
                 .apply { setPadding(0, dp(3), 0, 0) })
         }
         top.addView(identity)
-        top.addView(text("历史 ${store.logSize(c0.id)} 条", 11.5f, violet, bold = true))
+        val envCounts = store.historyEnvironments(c0.id).map { env ->
+            "${appLabel(env)} ${store.logSize(c0.id, env)}"
+        }
+        top.addView(text(
+            if (envCounts.isEmpty()) "历史 0 条" else envCounts.joinToString(" · "),
+            11.5f, violet, bold = true
+        ))
         c.addView(top)
         if (c0.apps.isNotEmpty())
             c.addView(text("来源：" + c0.apps.joinToString("、") { appLabel(it) }, 12f, sub)
@@ -314,7 +320,7 @@ class KnowledgeActivity : AppCompatActivity() {
             text = "查看已记录历史（$logN 条）"
             textSize = 12.5f; setTextColor(accent); setTypeface(typeface, Typeface.BOLD)
             setPadding(0, dp(8), 0, dp(2))
-            setOnClickListener { historyDialog(c0) }
+            setOnClickListener { chooseHistoryEnvironment(c0) }
         }
         c.addView(inspect)
         val styleInspect = TextView(this).apply {
@@ -437,8 +443,24 @@ class KnowledgeActivity : AppCompatActivity() {
         }
     }
 
-    private fun historyDialog(contact: Contact) {
-        val entries = store.allLog(contact.id)
+    private fun chooseHistoryEnvironment(contact: Contact) {
+        val environments = store.historyEnvironments(contact.id)
+        if (environments.isEmpty()) {
+            historyDialog(contact, null)
+            return
+        }
+        val labels = environments.map { env ->
+            "${appLabel(env)}（${store.logSize(contact.id, env)} 条）"
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("选择聊天环境")
+            .setItems(labels) { _, which -> historyDialog(contact, environments[which]) }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun historyDialog(contact: Contact, environment: String?) {
+        val entries = store.allLog(contact.id, environment)
         val seen = HashSet<String>()
         val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -462,7 +484,7 @@ class KnowledgeActivity : AppCompatActivity() {
             )
         }
         val dialog = AlertDialog.Builder(this)
-            .setTitle("${contact.name} · 本地历史")
+            .setTitle("${contact.name} · ${if (environment == null) "本地历史" else appLabel(environment)}")
             .setView(scroll)
             .setPositiveButton("关闭", null)
             .show()

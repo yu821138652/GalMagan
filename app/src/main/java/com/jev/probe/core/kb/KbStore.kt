@@ -31,7 +31,9 @@ class KbStore private constructor(context: Context) {
     private val contactsFile: File get() = File(root, "contacts.json")
     private val globalStyleFile: File get() = File(root, "style-global.json")
     private fun logFile(contactId: String) = File(File(root, "logs"), "$contactId.json")
-    private fun screenFile(contactId: String) = File(File(root, "logs"), "$contactId.screen.json")
+    private fun screenKey(contactId: String, environment: String) = "$contactId:$environment"
+    private fun screenFile(contactId: String, environment: String) =
+        File(File(root, "logs"), "$contactId.${environment.ifBlank { "unknown" }}.screen.json")
     private fun styleFile(contactId: String) = File(File(root, "styles"), "$contactId.json")
 
     private var notesCache: MutableList<Note>? = null
@@ -134,10 +136,7 @@ class KbStore private constructor(context: Context) {
             ok = writeAtomic(contactsFile, contactsJson(list))
             if (!ok) contactsCache = null
         }
-        logCache.remove(id)
-        lastScreenCache.remove(id)
-        runCatching { logFile(id).delete() }
-        runCatching { screenFile(id).delete() }
+        clearLog(id)
         runCatching { styleFile(id).delete() }
         ok
     }
@@ -217,13 +216,21 @@ class KbStore private constructor(context: Context) {
      *        is appended as-is.
      */
     fun appendLog(contactId: String, entries: List<LogEntry>, screenBatch: Boolean = true): Boolean {
+        return synchronized(lock) {
+            entries.groupBy { it.app }.map { (environment, batch) ->
+                appendEnvironment(contactId, environment, batch, screenBatch)
+            }.all { it }
+        }
+    }
+
+    private fun appendEnvironment(contactId: String, environment: String, entries: List<LogEntry>, screenBatch: Boolean): Boolean {
         if (entries.isEmpty()) return true
         synchronized(lock) {
             val screen = entries.filter { it.text.isNotBlank() }
             if (screen.isEmpty()) return true
-            val list = loadLog(contactId)
+            val list = loadLog(contactId).filter { it.app == environment }.toMutableList()
             val keys = screen.map { key(it.side, it.text) }
-            val prev = if (screenBatch) loadLastScreen(contactId) else emptyList()
+            val prev = if (screenBatch) loadLastScreen(contactId, environment) else emptyList()
 
             // Same screen as last time: nothing happened worth recording.
             if (screenBatch && prev.isNotEmpty() && prev == keys) return true
@@ -231,7 +238,7 @@ class KbStore private constructor(context: Context) {
             // Preloading can leave the newest screen away from the log tail.
             // Treat an exact sequence found anywhere in the log as an old page.
             if (screenBatch && containsSequence(list.map { key(it.side, it.text) }, keys)) {
-                saveLastScreen(contactId, keys)
+                saveLastScreen(contactId, environment, keys)
                 return true
             }
 
@@ -263,25 +270,24 @@ class KbStore private constructor(context: Context) {
                 }
             }
             if (tail.isEmpty()) {
-                if (screenBatch) saveLastScreen(contactId, keys)
+                if (screenBatch) saveLastScreen(contactId, environment, keys)
                 return true
             }
 
             list.addAll(tail)
             while (list.size > MAX_LOG) list.removeAt(0)
-            val ok = writeAtomic(logFile(contactId), logJson(list))
-            if (!ok) logCache.remove(contactId)
-            if (ok && screenBatch) saveLastScreen(contactId, keys)
+            val ok = saveEnvironment(contactId, environment, list)
+            if (ok && screenBatch) saveLastScreen(contactId, environment, keys)
             Log.d(TAG, "appendLog contact=$contactId added=${tail.size} overlap=$k total=${list.size} ok=$ok")
             return ok
         }
     }
 
     /** The newest [n] entries, oldest first. */
-    fun recentLog(contactId: String, n: Int): List<LogEntry> {
+    fun recentLog(contactId: String, n: Int, environment: String? = null): List<LogEntry> {
         if (n <= 0) return emptyList()
         synchronized(lock) {
-            val list = loadLog(contactId)
+            val list = loadLog(contactId).filter { environment == null || it.app == environment }
             return if (list.size <= n) list.toList()
             else list.subList(list.size - n, list.size).toList()
         }
@@ -293,16 +299,25 @@ class KbStore private constructor(context: Context) {
      * The overlapping suffix/prefix is kept only once.
      */
     fun prependLog(contactId: String, entries: List<LogEntry>): Boolean {
+        return synchronized(lock) {
+            entries.groupBy { it.app }.map { (environment, batch) ->
+                prependEnvironment(contactId, environment, batch)
+            }.all { it }
+        }
+    }
+
+    private fun prependEnvironment(contactId: String, environment: String, entries: List<LogEntry>): Boolean {
         if (entries.isEmpty()) return true
         synchronized(lock) {
             val screen = entries.filter { it.text.isNotBlank() }
             if (screen.isEmpty()) return true
-            val list = loadLog(contactId)
+            val list = loadLog(contactId).filter { it.app == environment }.toMutableList()
             if (list.isEmpty()) {
                 list.addAll(screen)
             } else {
                 val existingKeys = list.map { key(it.side, it.text) }
                 val incomingKeys = screen.map { key(it.side, it.text) }
+                if (containsSequence(existingKeys, incomingKeys)) return true
                 var overlap = 0
                 val max = minOf(existingKeys.size, incomingKeys.size)
                 for (candidate in max downTo 1) {
@@ -312,30 +327,44 @@ class KbStore private constructor(context: Context) {
                     }
                 }
                 val known = existingKeys.toHashSet()
-                val older = (if (overlap == 0) screen else screen.dropLast(overlap))
-                    .filter { key(it.side, it.text) !in known }
+                val older = if (overlap > 0) screen.dropLast(overlap)
+                    else screen.filter { key(it.side, it.text) !in known }
                 if (older.isNotEmpty()) list.addAll(0, older)
             }
             while (list.size > MAX_LOG) list.removeAt(0)
-            val ok = writeAtomic(logFile(contactId), logJson(list))
-            if (!ok) logCache.remove(contactId)
+            val ok = saveEnvironment(contactId, environment, list)
             Log.d(TAG, "prependLog contact=$contactId added=${screen.size} ok=$ok")
             return ok
         }
     }
 
     /** Full retained history for inspection; oldest first. */
-    fun allLog(contactId: String): List<LogEntry> = synchronized(lock) {
-        loadLog(contactId).toList()
+    fun allLog(contactId: String, environment: String? = null): List<LogEntry> = synchronized(lock) {
+        loadLog(contactId).filter { environment == null || it.app == environment }
     }
 
-    fun logSize(contactId: String): Int = synchronized(lock) { loadLog(contactId).size }
+    fun logSize(contactId: String, environment: String? = null): Int = allLog(contactId, environment).size
+
+    fun historyEnvironments(contactId: String): List<String> = synchronized(lock) {
+        loadLog(contactId).map { it.app }.distinct()
+    }
+
+    // Keep the existing file format so older records need no destructive migration.
+    // Each environment is merged, deduplicated and capped independently.
+    private fun saveEnvironment(contactId: String, environment: String, entries: List<LogEntry>): Boolean {
+        val merged = loadLog(contactId).filter { it.app != environment } + entries
+        val ok = writeAtomic(logFile(contactId), logJson(merged))
+        if (ok) logCache[contactId] = merged.toMutableList() else logCache.remove(contactId)
+        return ok
+    }
 
     fun clearLog(contactId: String) = synchronized(lock) {
         logCache.remove(contactId)
-        lastScreenCache.remove(contactId)
+        lastScreenCache.keys.removeAll { it.startsWith("$contactId:") }
         runCatching { logFile(contactId).delete() }
-        runCatching { screenFile(contactId).delete() }
+        File(root, "logs").listFiles()?.filter {
+            it.name.startsWith("$contactId.") && it.name.endsWith(".screen.json")
+        }?.forEach { it.delete() }
         Unit
     }
 
@@ -344,25 +373,27 @@ class KbStore private constructor(context: Context) {
      * comparison keys. Kept on disk as well as in memory so that re-opening a
      * chat that has not moved since does not append the same screen again.
      */
-    private fun loadLastScreen(contactId: String): List<String> {
-        lastScreenCache[contactId]?.let { return it }
+    private fun loadLastScreen(contactId: String, environment: String): List<String> {
+        val cacheKey = screenKey(contactId, environment)
+        lastScreenCache[cacheKey]?.let { return it }
         val out = ArrayList<String>()
-        val loaded = readJsonArray(screenFile(contactId))
+        val loaded = readJsonArray(screenFile(contactId, environment))
         loaded.arr?.let { arr ->
             for (i in 0 until arr.length()) {
                 val s = arr.optString(i)
                 if (s.isNotEmpty()) out.add(s)
             }
         }
-        if (loaded.trustworthy) lastScreenCache[contactId] = out
+        if (loaded.trustworthy) lastScreenCache[cacheKey] = out
         return out
     }
 
-    private fun saveLastScreen(contactId: String, keys: List<String>) {
-        lastScreenCache[contactId] = keys
+    private fun saveLastScreen(contactId: String, environment: String, keys: List<String>) {
+        val cacheKey = screenKey(contactId, environment)
+        lastScreenCache[cacheKey] = keys
         val arr = JSONArray()
         keys.forEach { arr.put(it) }
-        if (!writeAtomic(screenFile(contactId), arr.toString())) lastScreenCache.remove(contactId)
+        if (!writeAtomic(screenFile(contactId, environment), arr.toString())) lastScreenCache.remove(cacheKey)
     }
 
     private fun containsSequence(haystack: List<String>, needle: List<String>): Boolean {

@@ -82,11 +82,35 @@ open class ChatCaptureService : AccessibilityService() {
     private var selectedContact: com.jev.probe.core.kb.Contact? = null
     private var defaultContextSelected = false
     private var historyImporting = false
+    private var selectedHistoryEnvironment: String? = null
+    private data class HistoryImportSession(
+        val contact: com.jev.probe.core.kb.Contact,
+        val environment: String,
+        var pages: Int = 0,
+        var added: Int = 0,
+        var duplicates: Int = 0,
+        var lastKeys: List<String> = emptyList(),
+        var waitingSince: Long = SystemClock.elapsedRealtime(),
+        var awaitingScroll: Boolean = false
+    )
+    private var historySession: HistoryImportSession? = null
+    private val historyStep = Runnable { stepHistoryImport() }
     private val enabledReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == ACTION_SETUP_HISTORY) {
+                if (historyImporting) { overlay?.toast("请先停止当前预加载"); return }
+                val contact = intent.getStringExtra(EXTRA_CONTACT_ID)?.let { KbStore.get(this@ChatCaptureService).contact(it) }
+                if (contact != null) {
+                    selectedContact = contact
+                    defaultContextSelected = false
+                    overlay?.showEnvironmentChooser(contact)
+                }
+                return
+            }
             if (intent?.action != ACTION_SET_ENABLED) return
             val enabled = intent.getBooleanExtra(EXTRA_ENABLED, false)
             if (!enabled) {
+                stopHistoryImport()
                 overlay?.hide()
                 stopKeepAlive()
             } else {
@@ -117,11 +141,27 @@ open class ChatCaptureService : AccessibilityService() {
         super.onServiceConnected()
         prefs = Prefs(this)
         overlay = OverlayController(this)
-        registerReceiver(enabledReceiver, IntentFilter(ACTION_SET_ENABLED), RECEIVER_NOT_EXPORTED)
+        registerReceiver(enabledReceiver, IntentFilter(ACTION_SET_ENABLED).apply {
+            addAction(ACTION_SETUP_HISTORY)
+        }, RECEIVER_NOT_EXPORTED)
         if (prefs.enabled) overlay?.showIdle(null)
         else stopKeepAlive()
         overlay?.onManualAnalyze = {
-            currentSnapshot?.let { pendingSnapshot = it; runAnalysis() }
+            if (!historyImporting) {
+                val root = chatRoot(selectedHistoryEnvironment ?: activePkg)
+                val pkg = root?.packageName?.toString()
+                val fresh = root?.let { adapters[pkg]?.extract(it, resources) }
+                val available = fresh?.takeIf { it.messages.isNotEmpty() } ?: currentSnapshot
+                when {
+                    available == null || available.messages.isEmpty() -> overlay?.toast("请回到当前聊天页，尚未读取到消息")
+                    fresh?.atLatest == false -> overlay?.toast("请先回到聊天底部，再分析最新对话")
+                    else -> {
+                        activePkg = pkg
+                        val corrected = available.copy(title = if (defaultContextSelected) null else selectedContact?.name ?: available.title)
+                        currentSnapshot = corrected; pendingSnapshot = corrected; runAnalysis()
+                    }
+                }
+            }
         }
         overlay?.onListContacts = {
             runCatching { KbStore.get(this).contacts() }.getOrDefault(emptyList())
@@ -129,32 +169,22 @@ open class ChatCaptureService : AccessibilityService() {
         overlay?.onContactSelected = { contact ->
             selectedContact = contact
             defaultContextSelected = false
-            val snapshot = currentSnapshot
-            if (snapshot == null) {
-                val pkg = rootInActiveWindow?.packageName?.toString() ?: foregroundPkg ?: activePkg ?: ""
-                val raw = rootInActiveWindow?.let { adapters[pkg]?.extract(it, resources) }
-                if (raw != null) currentSnapshot = raw.copy(title = contact.name)
-                overlay?.showContactHistory(contact, KbStore.get(this).allLog(contact.id))
-            } else {
-                val pkg = activePkg ?: foregroundPkg ?: ""
-                manualTitleOverrides[pkg] = ManualTitleOverride(
-                    lastObservedTitles[pkg] ?: snapshot.title,
-                    contact.name
-                )
-                val corrected = snapshot.copy(title = contact.name)
-                currentSnapshot = corrected
-                pendingSnapshot = corrected
-                // The title participates in ChatSnapshot.signature(), but clear
-                // the cached value explicitly so a manual correction always
-                // causes a fresh knowledge-base lookup and analysis.
-                lastSignature = ""
-                overlay?.setConversationInfo(corrected.title, corrected.latestFrom == "me")
-                overlay?.showContactHistory(contact, KbStore.get(this).allLog(contact.id))
+            selectedHistoryEnvironment = null
+            overlay?.showEnvironmentChooser(contact)
+        }
+        overlay?.onEnvironmentSelected = { environment ->
+            selectedHistoryEnvironment = environment
+            activePkg = environment
+            lastSignature = ""
+            selectedContact?.let { contact ->
+                overlay?.showContactHistory(contact, KbStore.get(this).allLog(contact.id, environment), environment)
             }
         }
+        overlay?.onHistorySetup = { overlay?.showHistorySetup() }
         overlay?.onDefaultSelected = {
             val pkg = activePkg ?: foregroundPkg ?: ""
             selectedContact = null
+            selectedHistoryEnvironment = null
             defaultContextSelected = true
             manualTitleOverrides.remove(pkg)
             lastSignature = ""
@@ -183,9 +213,10 @@ open class ChatCaptureService : AccessibilityService() {
         }
         // Bubble menu: one manual screenshot + OCR, for any app at all.
         overlay?.onOcrCapture = { ocrCaptureManual() }
-        overlay?.onImportHistory = { importHistory() }
+        overlay?.onImportHistory = { environment -> importHistory(environment) }
         overlay?.onStopImportHistory = { stopHistoryImport() }
         overlay?.onDisable = {
+            stopHistoryImport()
             prefs.enabled = false
             overlay?.hide()
             stopKeepAlive()
@@ -239,7 +270,7 @@ open class ChatCaptureService : AccessibilityService() {
     }
 
     private fun maybeCapture() {
-        if (historyImporting) return
+        if (historyImporting || overlay?.blocksAutoAnalysis() == true) return
         val root = rootInActiveWindow ?: return
         val pkg = root.packageName?.toString()
         if (pkg != null && activePkg != null && pkg != activePkg) {
@@ -258,7 +289,7 @@ open class ChatCaptureService : AccessibilityService() {
         val detectedSnapshot = stabilizeTitle(pkg ?: "", rawSnapshot)
         lastObservedTitles[pkg ?: ""] = detectedSnapshot.title
         val snapshot = applyManualTitleOverride(pkg ?: "", detectedSnapshot)
-        val identified = if (pkg == "com.tencent.mm" && selectedContact != null) {
+        val identified = if (selectedContact != null && (selectedHistoryEnvironment == null || selectedHistoryEnvironment == pkg)) {
             snapshot.copy(title = selectedContact!!.name)
         } else snapshot
         overlay?.setConversationInfo(identified.title, identified.latestFrom == "me")
@@ -404,6 +435,7 @@ open class ChatCaptureService : AccessibilityService() {
     }
 
     private fun runAnalysis() {
+        if (historyImporting) return
         val snapshot = pendingSnapshot ?: return
         if (analyzing) return
 
@@ -854,6 +886,10 @@ open class ChatCaptureService : AccessibilityService() {
     override fun onInterrupt() {}
 
     override fun onDestroy() {
+        main.removeCallbacks(historyStep)
+        main.removeCallbacks(debounce)
+        historySession = null
+        historyImporting = false
         super.onDestroy()
         runCatching { unregisterReceiver(enabledReceiver) }
         // Tear the overlay down and cut its callback so a stale button tap can
@@ -866,6 +902,8 @@ open class ChatCaptureService : AccessibilityService() {
         overlay?.onSaveContact = null
         overlay?.onOcrCapture = null
         overlay?.onImportHistory = null
+        overlay?.onEnvironmentSelected = null
+        overlay?.onHistorySetup = null
         overlay?.onStopImportHistory = null
         overlay?.hide()
         overlay = null
@@ -877,55 +915,125 @@ open class ChatCaptureService : AccessibilityService() {
     }
 
     /** Import older visible windows into the selected contact without analysis. */
-    private fun importHistory() {
+    private fun importHistory(pkg: String) {
         if (historyImporting) { overlay?.toast("历史预采集正在进行"); return }
         val contact = selectedContact
         if (contact == null) { overlay?.toast("请先选择知识库联系人"); return }
-        val pkg = rootInActiveWindow?.packageName?.toString() ?: foregroundPkg ?: activePkg ?: ""
         if (pkg.isBlank() || adapters[pkg] == null) {
             overlay?.toast("当前应用暂不支持历史预采集"); return
         }
+        main.removeCallbacks(debounce)
+        main.removeCallbacks(historyStep)
+        pendingSnapshot = null
         historyImporting = true
         activePkg = pkg
-        var pages = 0
-        fun finish() {
-            historyImporting = false
-            currentSnapshot = null
-            val total = runCatching { KbStore.get(this).logSize(contact.id) }.getOrDefault(0)
-            overlay?.setNote("历史预采集完成：本地已有 $total 条，请回到聊天底部后再分析")
-            main.post { overlay?.showContactHistory(contact, KbStore.get(this).allLog(contact.id)) }
-        }
-        fun step() {
-            if (!historyImporting || pages >= HISTORY_IMPORT_MAX_PAGES) { finish(); return }
-            val root = rootInActiveWindow
-            if (root?.packageName?.toString() != pkg) { finish(); return }
-            val raw = adapters[pkg]?.extract(root, resources)
-            if (raw != null && raw.messages.isNotEmpty()) {
-                val snapshot = if (pkg == "com.tencent.mm") raw.copy(title = contact.name) else raw
-                KbStore.get(this).prependLog(contact.id, snapshot.messages.map {
-                    com.jev.probe.core.kb.LogEntry(it.side, it.text, System.currentTimeMillis(), pkg)
-                })
-                val total = runCatching { KbStore.get(this).logSize(contact.id) }.getOrDefault(0)
-                overlay?.setRecognitionInfo("历史预采集", snapshot.messages)
-                overlay?.setNote("正在预采集历史：已保存约 $total 条")
-                overlay?.setHistoryImportProgress(contact, KbStore.get(this).allLog(contact.id), pages + 1, true)
-                if (total >= HISTORY_IMPORT_TARGET) { finish(); return }
+        selectedHistoryEnvironment = pkg
+        val session = HistoryImportSession(contact, pkg)
+        historySession = session
+        updateHistoryProgress(session, "准备读取，请打开该联系人的${com.jev.probe.core.kb.ChatEnvironment.label(pkg)}聊天并回到最新消息")
+        main.postDelayed(historyStep, HISTORY_IMPORT_DELAY_MS)
+    }
+
+    /** The floating window may be active; read the focused application beneath it. */
+    private fun chatRoot(expectedPkg: String?): AccessibilityNodeInfo? {
+        val active = rootInActiveWindow
+        if (active != null && (expectedPkg == null || active.packageName?.toString() == expectedPkg)) return active
+        return windows.firstOrNull {
+            it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION &&
+                (it.isActive || it.isFocused) &&
+                (expectedPkg == null || it.root?.packageName?.toString() == expectedPkg)
+        }?.root
+    }
+
+    private fun updateHistoryProgress(session: HistoryImportSession, message: String, running: Boolean = true) {
+        val entries = KbStore.get(this).allLog(session.contact.id, session.environment)
+        overlay?.setHistoryImportProgress(session.contact, session.environment, entries,
+            "$message\n已采集 ${session.pages} 页 · 新增 ${session.added} 条 · 重复 ${session.duplicates} 条\n本环境已保存 ${entries.size} 条", running)
+    }
+
+    private fun stepHistoryImport() {
+        val session = historySession ?: return
+        if (!historyImporting || !prefs.enabled) { stopHistoryImport(); return }
+        try {
+            val root = chatRoot(session.environment)
+            val raw = root?.let { adapters[session.environment]?.extract(it, resources) }
+            if (raw == null || raw.messages.isEmpty()) {
+                val message = if (root == null) "等待打开所选聊天环境"
+                    else if (raw == null) "等待进入该联系人的聊天页"
+                    else "未读到消息节点，请检查无障碍权限或手动翻页"
+                waitForHistoryPage(session, message)
+                return
+            }
+            if (session.pages == 0 && !raw.atLatest) {
+                waitForHistoryPage(session, "当前不在最新消息位置，请先回到聊天底部；确认后才开始预加载")
+                return
+            }
+            val keys = raw.messages.map { it.side + "\u001f" + KbStore.normalizeText(it.text) }
+            if (keys == session.lastKeys) {
+                val scroll = findHistoryScrollNode(root)
+                val moved = scroll?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) == true
+                session.awaitingScroll = moved
+                waitForHistoryPage(session, if (moved) "上一页仍在刷新，正在重试读取"
+                    else "页面未变化，请手动向上翻到更早消息；保留部分重叠消息")
+                return
+            }
+            val store = KbStore.get(this)
+            val before = store.logSize(session.contact.id, session.environment)
+            val entries = raw.messages.map {
+                com.jev.probe.core.kb.LogEntry(it.side, it.text, 0L, session.environment)
+            }
+            val ok = if (session.pages == 0) store.appendLog(session.contact.id, entries)
+                else store.prependLog(session.contact.id, entries)
+            if (!ok) { finishHistoryImport("保存失败：历史未成功写入，请检查手机存储空间"); return }
+            val added = (store.logSize(session.contact.id, session.environment) - before).coerceAtLeast(0)
+            session.added += added
+            session.duplicates += (entries.size - added).coerceAtLeast(0)
+            session.pages++
+            session.lastKeys = keys
+            session.waitingSince = SystemClock.elapsedRealtime()
+            overlay?.setRecognitionInfo("历史预加载 · 无障碍节点", raw.messages)
+            if (session.pages >= HISTORY_IMPORT_MAX_PAGES || store.logSize(session.contact.id, session.environment) >= KbStore.MAX_LOG) {
+                finishHistoryImport("本轮已完成，达到采集上限；请回到最新消息后分析")
+                return
             }
             val scroll = findHistoryScrollNode(root)
             val moved = scroll?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) == true
-            pages++
-            if (!moved) finish() else main.postDelayed(::step, HISTORY_IMPORT_DELAY_MS)
+            session.awaitingScroll = moved
+            updateHistoryProgress(session, if (moved) "已保存本页，正在向上读取更早消息"
+                else "本页已保存，请手动向上翻页；到达最早记录后点击停止并保存")
+            main.postDelayed(historyStep, HISTORY_IMPORT_DELAY_MS)
+        } catch (e: Exception) {
+            Log.w(TAG, "history import failed: ${e.javaClass.simpleName}")
+            finishHistoryImport("预加载出错：${e.javaClass.simpleName}，已成功保存的记录保留")
         }
-        main.post(::step)
+    }
+
+    private fun waitForHistoryPage(session: HistoryImportSession, message: String) {
+        val elapsed = SystemClock.elapsedRealtime() - session.waitingSince
+        if (elapsed >= HISTORY_IMPORT_WAIT_MS) {
+            finishHistoryImport(if (session.pages == 0) "预加载未完成：两分钟内没有读到消息"
+                else "等待超时，已结束本轮采集；已保存记录保留")
+            return
+        }
+        session.awaitingScroll = false
+        updateHistoryProgress(session, message)
+        main.postDelayed(historyStep, HISTORY_IMPORT_DELAY_MS)
     }
 
     private fun stopHistoryImport() {
         if (!historyImporting) return
+        finishHistoryImport("已停止，采集到的记录已保存；请回到最新消息后分析")
+    }
+
+    private fun finishHistoryImport(message: String) {
+        val session = historySession ?: return
         historyImporting = false
-        val contact = selectedContact ?: return
-        val total = runCatching { KbStore.get(this).logSize(contact.id) }.getOrDefault(0)
-        overlay?.setNote("已停止预加载，已保留 $total 条历史")
-        overlay?.showContactHistory(contact, KbStore.get(this).allLog(contact.id))
+        historySession = null
+        main.removeCallbacks(historyStep)
+        currentSnapshot = null
+        pendingSnapshot = null
+        lastSignature = ""
+        updateHistoryProgress(session, message, running = false)
     }
 
     private fun findHistoryScrollNode(root: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
@@ -936,8 +1044,8 @@ open class ChatCaptureService : AccessibilityService() {
         while (stack.isNotEmpty() && guard++ < 6000) {
             val node = stack.removeLast()
             val b = Rect(); node.getBoundsInScreen(b)
-            if (node.isScrollable && b.top > resources.displayMetrics.heightPixels * 0.10f &&
-                b.bottom < resources.displayMetrics.heightPixels * 0.90f &&
+            if (node.isScrollable && b.height() > resources.displayMetrics.heightPixels * 0.25f &&
+                b.centerY() in (resources.displayMetrics.heightPixels * 0.20f).toInt()..(resources.displayMetrics.heightPixels * 0.85f).toInt() &&
                 node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD }
             ) return node
             for (i in node.childCount - 1 downTo 0) node.getChild(i)?.let { stack.addLast(it) }
@@ -949,14 +1057,16 @@ open class ChatCaptureService : AccessibilityService() {
         private const val TAG = "JEVASSIST"
         const val ACTION_SET_ENABLED = "com.jev.probe.custom.SET_ENABLED"
         const val EXTRA_ENABLED = "enabled"
+        const val ACTION_SETUP_HISTORY = "com.jev.probe.custom.SETUP_HISTORY"
+        const val EXTRA_CONTACT_ID = "contact_id"
 
         /** Whole-screen OCR keeps the middle: no action bar, no input area. */
         private const val TITLE_CROP = 0.18f
         private const val TOP_CROP = 0.12f
         private const val BOTTOM_CROP = 0.84f
-        private const val HISTORY_IMPORT_TARGET = 100
-        private const val HISTORY_IMPORT_MAX_PAGES = 24
-        private const val HISTORY_IMPORT_DELAY_MS = 450L
+        private const val HISTORY_IMPORT_MAX_PAGES = 100
+        private const val HISTORY_IMPORT_DELAY_MS = 1000L
+        private const val HISTORY_IMPORT_WAIT_MS = 120_000L
 
         /** Said on the panel whenever a snapshot came from flat-screen OCR. */
         private const val OCR_NOTE = "OCR 按消息气泡左右位置推断我方/对方，复杂布局可能需要人工确认"
