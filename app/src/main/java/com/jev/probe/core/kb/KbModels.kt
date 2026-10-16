@@ -43,7 +43,13 @@ data class Contact(
 )
 
 /** One remembered chat line. side is "me" / "other", matching [com.jev.probe.core.Msg]. */
-data class LogEntry(val side: String, val text: String, val ts: Long, val app: String)
+data class LogEntry(
+    val side: String,
+    val text: String,
+    val ts: Long,
+    val app: String,
+    val id: String = java.util.UUID.randomUUID().toString()
+)
 
 /** A deliberately synthesized local description of the user's wording. */
 data class StyleProfile(

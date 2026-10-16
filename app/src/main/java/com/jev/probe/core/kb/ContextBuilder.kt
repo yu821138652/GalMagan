@@ -52,7 +52,7 @@ object ContextBuilder {
         // Selected contact identity scopes a local history log. Do not let a
         // legacy opt-in toggle silently prevent history from being sent.
         val history = if (contact != null)
-            historyFor(store, contact, snapshot, app, prefs) else emptyList()
+            historyFor(store, contact, snapshot, prefs) else emptyList()
 
         // 3. Notes — always-on ones plus keyword hits.
         val enabled = store.notes().filter { it.enabled }
@@ -101,7 +101,6 @@ object ContextBuilder {
         store: KbStore,
         contact: Contact,
         snapshot: ChatSnapshot,
-        app: String,
         prefs: Prefs
     ): List<LogEntry> {
         val n = prefs.contextHistoryCount.coerceIn(0, 100)
@@ -113,7 +112,9 @@ object ContextBuilder {
         // Filter the widest window FIRST, then take n. The other order lets the
         // messages currently on screen eat into the quota — ask for 30 lines of
         // history, get 30 minus however many are already visible.
-        return store.recentLog(contact.id, KbStore.MAX_LOG, app)
+        // Storage remains isolated by contact + app, but analysis intentionally
+        // sees this person's recent history across all chat environments.
+        return store.recentLog(contact.id, KbStore.MAX_LOG, null)
             .filter { (it.side + " " + it.text) !in onScreen }
             .takeLast(n)
     }

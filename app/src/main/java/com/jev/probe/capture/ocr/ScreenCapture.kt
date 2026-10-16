@@ -63,7 +63,12 @@ class ScreenCapture(
     private val main = Handler(Looper.getMainLooper())
 
     /** Take one screenshot. [onResult] runs on the main thread, exactly once. */
-    fun capture(onResult: (Result) -> Unit) {
+    fun capture(
+        expectedPackage: String,
+        allowWeChat: Boolean = false,
+        isRequestValid: () -> Boolean = { true },
+        onResult: (Result) -> Unit
+    ) {
         val now = SystemClock.elapsedRealtime()
         val need = requiredInterval()
         if (now - lastAttemptAt < need) {
@@ -84,10 +89,24 @@ class ScreenCapture(
 
         // Hide the bubble, give the compositor a frame to drop it, then shoot.
         runCatching { hideOverlay() }
-        main.postDelayed({ shoot(finish, done) }, HIDE_SETTLE_MS)
+        main.postDelayed({
+            if (!isRequestValid()) finish(Result.Failed(CODE_INTERNAL, "本次识别已停止"))
+            else shoot(expectedPackage, allowWeChat, finish, done)
+        }, HIDE_SETTLE_MS)
     }
 
-    private fun shoot(finish: (Result) -> Unit, done: AtomicBoolean) {
+    private fun shoot(expectedPackage: String, allowWeChat: Boolean, finish: (Result) -> Unit, done: AtomicBoolean) {
+        val active = service.rootInActiveWindow
+        val applicationType = android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION
+        val target = if (active?.window?.type == applicationType) active
+        else service.windows.filter { it.type == applicationType }
+            .sortedWith(compareByDescending<android.view.accessibility.AccessibilityWindowInfo> { it.isActive || it.isFocused }
+                .thenByDescending { it.layer }).firstOrNull()?.root
+        val pkg = target?.packageName?.toString()
+        if (pkg != expectedPackage || pkg == "com.tencent.mm" && !allowWeChat) {
+            finish(Result.Failed(CODE_INTERNAL, "已取消截屏：当前应用已切换，或微信自动截图已关闭"))
+            return
+        }
         val exec = service.mainExecutor
         // Which area the picture will cover. Set just before the window shot is
         // issued and read inside the callback, so the mapping always matches the
@@ -115,7 +134,7 @@ class ScreenCapture(
         // some OEM builds that refuse a whole-display capture. Fall back to the
         // display shot when the window id is unknown or the call is unavailable.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            val node = runCatching { service.rootInActiveWindow }.getOrNull()
+            val node = target
             val windowId = node?.windowId
             if (windowId != null && windowId != -1) {
                 windowBounds = runCatching {

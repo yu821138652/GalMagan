@@ -10,7 +10,11 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.EditText
+import android.widget.CheckBox
+import android.widget.ImageButton
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -460,35 +464,214 @@ class KnowledgeActivity : AppCompatActivity() {
     }
 
     private fun historyDialog(contact: Contact, environment: String?) {
-        val entries = store.allLog(contact.id, environment)
-        val seen = HashSet<String>()
         val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(18), dp(8), dp(18), dp(8))
         }
-        if (entries.isEmpty()) {
-            body.addView(text("这个联系人还没有本地历史记录。", 13f, sub))
-        } else {
-            body.addView(text("共 ${entries.size} 条，按保存顺序显示。相同发送方和文本再次出现时标记为可能重复。",
-                12f, sub).apply { setPadding(0, 0, 0, dp(8)) })
+        val scroll = ScrollView(this).apply {
+            addView(body)
+        }
+        val toolbar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), 0, dp(12), dp(6))
+        }
+        val selection = LinkedHashSet<String>()
+        var selecting = false
+        var entries = store.allLog(contact.id, environment)
+        val rowViews = LinkedHashMap<String, View>()
+        data class Anchor(val offsets: List<Pair<String, Int>>, val scrollY: Int)
+        fun rememberPosition(): Anchor {
+            val rows = rowViews.entries.toList()
+            val pivot = rows.indexOfFirst { it.value.bottom > scroll.scrollY }.coerceAtLeast(0)
+            return Anchor((rows.drop(pivot) + rows.take(pivot).asReversed()).map {
+                it.key to (it.value.top - scroll.scrollY)
+            }, scroll.scrollY)
+        }
+        fun restorePosition(anchor: Anchor) {
+            val target = anchor.offsets.firstNotNullOfOrNull { (id, offset) ->
+                rowViews[id]?.let { it to offset }
+            }
+            scroll.post {
+                val position = target?.let { (view, offset) -> view.top - offset } ?: anchor.scrollY
+                scroll.scrollTo(0, position.coerceAtLeast(0))
+            }
+        }
+        lateinit var updateToolbar: () -> Unit
+        fun drawRows(anchor: Anchor? = null) {
+            entries = store.allLog(contact.id, environment)
+            selection.retainAll(entries.map { it.id }.toSet())
+            rowViews.clear()
+            body.removeAllViews()
+            val seen = HashSet<String>()
+            if (entries.isEmpty()) body.addView(text("这个联系人还没有本地历史记录。", 13f, sub))
+            else body.addView(text("共 ${entries.size} 条", 12f, sub).apply {
+                setPadding(0, 0, 0, dp(8))
+            })
             entries.forEachIndexed { index, entry ->
                 val key = entry.side + "\u001f" + entry.text
                 val duplicate = !seen.add(key)
-                body.addView(historyBubble(index + 1, entry, duplicate))
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                }
+                val checkbox = CheckBox(this).apply {
+                    contentDescription = "选择第 ${index + 1} 条消息"
+                    visibility = if (selecting) View.VISIBLE else View.GONE
+                    isChecked = entry.id in selection
+                    setOnCheckedChangeListener { _, checked ->
+                        if (checked) selection.add(entry.id) else selection.remove(entry.id)
+                        updateToolbar()
+                    }
+                }
+                row.addView(checkbox, LinearLayout.LayoutParams(dp(44), dp(48)))
+                val bubble = historyBubble(index + 1, entry, duplicate)
+                row.addView(bubble, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                val onLongPress = View.OnLongClickListener {
+                    if (selecting) {
+                        checkbox.isChecked = !checkbox.isChecked
+                        return@OnLongClickListener true
+                    }
+                    val actions = AlertDialog.Builder(this)
+                        .setTitle("第 ${index + 1} 条消息")
+                        .setItems(arrayOf("编辑消息", "删除消息", "多选消息")) { _, which ->
+                            if (which == 0) {
+                                editHistoryEntry(contact, entry) {
+                                    drawRows(rememberPosition())
+                                    render()
+                                }
+                            } else if (which == 1) {
+                                val confirm = AlertDialog.Builder(this)
+                                    .setTitle("删除这条消息？")
+                                    .setMessage(entry.text)
+                                    .setNegativeButton("取消", null)
+                                    .setPositiveButton("删除") { _, _ ->
+                                        if (store.deleteLogEntry(contact.id, entry.id)) {
+                                            drawRows(rememberPosition())
+                                            render()
+                                        } else toast("删除失败，请重新打开历史记录后重试")
+                                    }.show()
+                                styleDialogWindow(confirm)
+                            } else {
+                                val position = rememberPosition()
+                                selecting = true
+                                selection.add(entry.id)
+                                drawRows(position)
+                            }
+                        }.show()
+                    styleDialogWindow(actions)
+                    true
+                }
+                fun bindActions(view: View) {
+                    view.setOnLongClickListener(onLongPress)
+                    if (selecting) view.setOnClickListener { checkbox.isChecked = !checkbox.isChecked }
+                    if (view is ViewGroup) {
+                        for (child in 0 until view.childCount) bindActions(view.getChildAt(child))
+                    }
+                }
+                bindActions(bubble)
+                rowViews[entry.id] = row
+                body.addView(row)
+            }
+            updateToolbar()
+            if (anchor != null) restorePosition(anchor)
+        }
+        updateToolbar = {
+            toolbar.removeAllViews()
+            toolbar.addView(smallAction(if (selecting) "完成" else "多选") {
+                val position = rememberPosition()
+                selecting = !selecting
+                selection.clear()
+                drawRows(position)
+            })
+            if (selecting) {
+                toolbar.addView(CheckBox(this).apply {
+                    text = "全选"
+                    setTextColor(ink)
+                    isChecked = entries.isNotEmpty() && selection.size == entries.size
+                    setOnCheckedChangeListener { _, checked ->
+                        val position = rememberPosition()
+                        selection.clear()
+                        if (checked) selection.addAll(entries.map { it.id })
+                        drawRows(position)
+                    }
+                })
+                toolbar.addView(text("已选 ${selection.size}", 12f, sub), LinearLayout.LayoutParams(0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                toolbar.addView(ImageButton(this).apply {
+                    setImageResource(android.R.drawable.ic_menu_delete)
+                    contentDescription = "删除选中消息"
+                    tooltipText = contentDescription
+                    setColorFilter(red)
+                    setBackgroundColor(Color.TRANSPARENT)
+                    isEnabled = selection.isNotEmpty()
+                    alpha = if (isEnabled) 1f else 0.35f
+                    setOnClickListener {
+                        val ids = selection.toSet()
+                        val confirm = AlertDialog.Builder(this@KnowledgeActivity)
+                            .setTitle("删除选中的 ${ids.size} 条消息？")
+                            .setNegativeButton("取消", null)
+                            .setPositiveButton("删除") { _, _ ->
+                                val position = rememberPosition()
+                                if (store.deleteLogEntries(contact.id, ids)) {
+                                    selection.clear()
+                                    drawRows(position)
+                                    render()
+                                } else toast("删除失败，请重新打开历史记录后重试")
+                            }.show()
+                        styleDialogWindow(confirm)
+                    }
+                }, LinearLayout.LayoutParams(dp(48), dp(48)))
             }
         }
-        val scroll = ScrollView(this).apply {
-            addView(body)
-            layoutParams = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(520)
-            )
+        val pane = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(toolbar)
+            addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+            minimumHeight = dp(280)
         }
+        drawRows()
         val dialog = AlertDialog.Builder(this)
             .setTitle("${contact.name} · ${if (environment == null) "本地历史" else appLabel(environment)}")
-            .setView(scroll)
+            .setView(pane)
             .setPositiveButton("关闭", null)
             .show()
         styleDialogWindow(dialog)
+        pane.layoutParams = pane.layoutParams.apply {
+            height = minOf(dp(540), (resources.displayMetrics.heightPixels * 0.62f).toInt())
+        }
+    }
+
+    private fun editHistoryEntry(contact: Contact, entry: com.jev.probe.core.kb.LogEntry, onSaved: () -> Unit) {
+        val box = dialogBox()
+        val sides = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
+        val mine = RadioButton(this).apply { id = View.generateViewId(); text = "我"; setTextColor(ink) }
+        val other = RadioButton(this).apply { id = View.generateViewId(); text = "对方"; setTextColor(ink) }
+        sides.addView(mine); sides.addView(other)
+        sides.check(if (entry.side == "me") mine.id else other.id)
+        val content = edit(entry.text, "消息正文").apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            minLines = 4
+            gravity = Gravity.TOP
+        }
+        box.addView(label("发送方")); box.addView(sides)
+        box.addView(label("消息内容")); box.addView(content)
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("编辑历史消息")
+            .setView(wrapScroll(box))
+            .setNegativeButton("取消", null)
+            .setPositiveButton("保存", null)
+            .show()
+        styleDialogWindow(dialog)
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            val text = content.text.toString().trim()
+            if (text.isEmpty()) { content.error = "消息内容不能空"; return@setOnClickListener }
+            if (store.updateLogEntry(contact.id, entry.id,
+                    if (sides.checkedRadioButtonId == mine.id) "me" else "other", text)) {
+                dialog.dismiss()
+                onSaved()
+            } else toast("保存失败，请重新打开历史记录后重试")
+        }
     }
 
     private fun historyBubble(index: Int, entry: com.jev.probe.core.kb.LogEntry, duplicate: Boolean): View {

@@ -358,15 +358,18 @@ class OverlayController(private val ctx: Context) {
         setOnClickListener { onClick() }
     }
 
-    fun showLoading() {
+    fun showLoading(status: String = "分析中…") {
         historyPanelVisible = false
+        choosingContact = false
+        lastJudgment = null
+        lastFill = null
         ensureRoot(); bubble?.alpha = 1f
         resetBubbleColor()
         ctxNotes = 0; ctxHistory = 0; ctxStyle = 0 // counts for the round that is starting
         historyInfo = null
         historyExpanded = false
         replyError = null              // this round has not failed (yet)
-        setContent(captureInfoViews() + listOf(hint("分析中…")))
+        setContent(captureInfoViews() + listOf(hint(status)))
         if (!expanded) toggle()
     }
 
@@ -375,16 +378,19 @@ class OverlayController(private val ctx: Context) {
         ctxNotes = notes; ctxHistory = history; ctxStyle = style
     }
 
-    /** Exact per-contact history records included in the current model input. */
-    fun setHistoryInfo(history: List<LogEntry>, current: List<com.jev.probe.core.Msg> = emptyList()) {
-        val combined = history.map { com.jev.probe.core.Msg(it.side, it.text) } + current
-        historyInfo = if (combined.isEmpty()) {
+    /** Exact message list sent to the analysis clients. */
+    fun setHistoryInfo(
+        messages: List<com.jev.probe.core.Msg>,
+        historyCount: Int,
+        currentCount: Int
+    ) {
+        historyInfo = if (messages.isEmpty()) {
             "本次分析实际上下文：0 条（本地历史 0 条，当前识别 0 条）"
         } else buildString {
-            append("本次分析实际上下文：").append(combined.size)
-                .append(" 条（本地历史 ").append(history.size)
-                .append(" 条，当前识别 ").append(current.size).append(" 条）\n")
-            combined.takeLast(100).forEachIndexed { index, item ->
+            append("本次分析实际上下文：").append(messages.size)
+                .append(" 条（本地历史 ").append(historyCount)
+                .append(" 条，当前识别 ").append(currentCount).append(" 条）\n")
+            messages.forEachIndexed { index, item ->
                 append(index + 1).append(". ")
                     .append(if (item.side == "me") "我：" else "对方：")
                     .append(item.text).append('\n')
@@ -521,12 +527,16 @@ class OverlayController(private val ctx: Context) {
     }
 
     fun showError(msg: String) {
+        historyPanelVisible = false
+        choosingContact = false
         ensureRoot(); bubble?.alpha = 1f
         resetBubbleColor()
         val views = captureInfoViews().toMutableList()
         views.add(line("出错了", "#DC2626", 14f, true))
         views.add(hint(msg))
+        views.add(bigButton("重新分析当前对话") { onManualAnalyze?.invoke() })
         setContent(views)
+        if (!expanded) toggle()
     }
 
     fun showJudgment(a: Analysis) {

@@ -64,6 +64,7 @@ open class ChatCaptureService : AccessibilityService() {
     private var lastSignature: String = ""
     private var activePkg: String? = null
     private var analyzing = false
+    private var analysisGeneration = 0L
 
     /** Last known-good (non-transient) title per package. See [isTransientTitle]:
      *  a page like X's DM thread briefly shows "连接中…" as `snapshot.title`
@@ -78,6 +79,8 @@ open class ChatCaptureService : AccessibilityService() {
     private var pendingSnapshot: ChatSnapshot? = null
     @Volatile private var currentSnapshot: ChatSnapshot? = null
     private var foregroundPkg: String? = null
+    private var lastNodeRefreshAt = 0L
+    private var windowDiagnostic = ""
     /** Explicit identity selected by the user; never inferred from WeChat UI text. */
     private var selectedContact: com.jev.probe.core.kb.Contact? = null
     private var defaultContextSelected = false
@@ -94,6 +97,9 @@ open class ChatCaptureService : AccessibilityService() {
         var awaitingScroll: Boolean = false
     )
     private var historySession: HistoryImportSession? = null
+    /** Invalidates an in-flight screenshot/OCR callback when a preload stops. */
+    private var historyOcrGeneration = 0L
+    private var historyOcrBusy = false
     private val historyStep = Runnable { stepHistoryImport() }
     private val enabledReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -146,23 +152,7 @@ open class ChatCaptureService : AccessibilityService() {
         }, RECEIVER_NOT_EXPORTED)
         if (prefs.enabled) overlay?.showIdle(null)
         else stopKeepAlive()
-        overlay?.onManualAnalyze = {
-            if (!historyImporting) {
-                val root = chatRoot(selectedHistoryEnvironment ?: activePkg)
-                val pkg = root?.packageName?.toString()
-                val fresh = root?.let { adapters[pkg]?.extract(it, resources) }
-                val available = fresh?.takeIf { it.messages.isNotEmpty() } ?: currentSnapshot
-                when {
-                    available == null || available.messages.isEmpty() -> overlay?.toast("请回到当前聊天页，尚未读取到消息")
-                    fresh?.atLatest == false -> overlay?.toast("请先回到聊天底部，再分析最新对话")
-                    else -> {
-                        activePkg = pkg
-                        val corrected = available.copy(title = if (defaultContextSelected) null else selectedContact?.name ?: available.title)
-                        currentSnapshot = corrected; pendingSnapshot = corrected; runAnalysis()
-                    }
-                }
-            }
-        }
+        overlay?.onManualAnalyze = { analyzeCurrentChat() }
         overlay?.onListContacts = {
             runCatching { KbStore.get(this).contacts() }.getOrDefault(emptyList())
         }
@@ -250,14 +240,16 @@ open class ChatCaptureService : AccessibilityService() {
         // The bubble does come off for places where it would only be in the way:
         // our own settings screens, the launcher, and the system UI.
         if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            val fg = rootInActiveWindow?.packageName?.toString()
+            val fg = chatRoot(null)?.packageName?.toString()
             if (fg != null && fg !in adapters) {
                 foregroundPkg = fg
                 // The master switch controls the overlay lifetime. Do not hide
                 // it merely because the current app is not an adapted chat;
                 // this is important when entering WeChat/QQ before their tree
                 // has produced a readable snapshot.
-                main.post { overlay?.showIdle(currentSnapshot?.title) }
+                if (!analyzing && !ocrBusy && !historyOcrBusy) {
+                    main.post { overlay?.showIdle(currentSnapshot?.title) }
+                }
                 return
             }
         }
@@ -270,40 +262,62 @@ open class ChatCaptureService : AccessibilityService() {
     }
 
     private fun maybeCapture() {
-        if (historyImporting || overlay?.blocksAutoAnalysis() == true) return
-        val root = rootInActiveWindow ?: return
+        if (historyImporting) return
+        val root = chatRoot(null) ?: return
         val pkg = root.packageName?.toString()
         if (pkg != null && activePkg != null && pkg != activePkg) {
-            // A manual contact choice belongs to one foreground chat app.
-            // Never carry a WeChat selection into another app's conversation.
-            selectedContact = null
-            defaultContextSelected = false
+            // A selected contact may have history in several chat apps. Keep
+            // the contact choice while changing the foreground environment;
+            // only the current messages switch with the app.
+            activePkg = pkg
+            lastSignature = ""
+            lastOcrSignature = ""
         }
         // Apps with no adapter are never handled automatically (v1.3 revision):
         // the only way in for them is the bubble menu's "截屏识别一次".
         val adapter = adapters[pkg] ?: return
         // Only act inside a chat window (the adapter returns null elsewhere).
-        val rawSnapshot = adapter.extract(root, resources) ?: return
+        val rawSnapshot = adapter.extract(root, resources) ?: run {
+            currentSnapshot = null
+            pendingSnapshot = null
+            main.removeCallbacks(debounce)
+            if (adapter is WeChatAdapter && !analyzing && !ocrBusy) {
+                overlay?.setRecognitionInfo(adapter.lastDiagnostic, emptyList())
+            }
+            return
+        }
         // Stabilize the title BEFORE anything below reads it: some apps (X) show
         // a transient "连接中…" title for a moment right after opening a thread.
         val detectedSnapshot = stabilizeTitle(pkg ?: "", rawSnapshot)
         lastObservedTitles[pkg ?: ""] = detectedSnapshot.title
         val snapshot = applyManualTitleOverride(pkg ?: "", detectedSnapshot)
-        val identified = if (selectedContact != null && (selectedHistoryEnvironment == null || selectedHistoryEnvironment == pkg)) {
+        val identified = if (selectedContact != null) {
             snapshot.copy(title = selectedContact!!.name)
         } else snapshot
+        if (identified.messages.isNotEmpty() && prefs.historyAutoUpdate && !defaultContextSelected &&
+            (identified.title == null || prefs.isAllowed(identified.title))) submit { runCatching {
+            ContextBuilder.recordVisible(this, identified, pkg ?: "")
+        } }
+        // Accessibility events from updating the overlay must not replace the
+        // loading state or start another OCR request during a manual analysis.
+        if (analyzing || ocrBusy || historyOcrBusy) return
         overlay?.setConversationInfo(identified.title, identified.latestFrom == "me")
         // An empty snapshot is still useful diagnostic state. In particular,
         // WeChat can expose the chat shell but hide both title and message text;
         // applying the whitelist first made this look exactly like "nothing was
         // found" when a contact whitelist was configured.
         if (identified.messages.isEmpty()) {
+            // Do not let a previous conversation remain eligible for the manual
+            // analyze action while the current page is still unreadable.
+            currentSnapshot = null
+            pendingSnapshot = null
             overlay?.setRecognitionInfo("无障碍节点：未读到消息文本", emptyList())
             if (!screenshotAllowed(pkg ?: "")) {
                 overlay?.setNote(wechatDiagnostic(identified))
                 main.post { overlay?.showIdle(identified.title, false) }
                 return
             }
+            if (overlay?.blocksAutoAnalysis() == true) return
         }
         // A missing title is intentional for WeChat: the user may use the
         // configured default relationship or choose a contact manually. It
@@ -352,12 +366,6 @@ open class ChatCaptureService : AccessibilityService() {
 
         currentSnapshot = identified
         overlay?.setRecognitionInfo("无障碍节点", identified.messages)
-        // Save as soon as a new visible window is recognized. This keeps the
-        // per-contact log current even when auto-analysis is disabled or the
-        // same screen is later deduplicated.
-        if (prefs.historyAutoUpdate && !defaultContextSelected) submit { runCatching {
-            ContextBuilder.recordVisible(this, identified, pkg ?: "")
-        } }
         if (!identified.atLatest) {
             // The user is looking at older messages. They are useful for
             // building the contact's local history, but must never be treated
@@ -367,6 +375,7 @@ open class ChatCaptureService : AccessibilityService() {
             main.post { overlay?.showIdle(identified.title, false) }
             return
         }
+        if (overlay?.blocksAutoAnalysis() == true) return
         val sig = identified.signature()
         val showing = overlay?.isShowing() == true
         // Same content and the bubble is already up → nothing to do.
@@ -434,13 +443,77 @@ open class ChatCaptureService : AccessibilityService() {
         return snapshot
     }
 
+    private fun analyzeCurrentChat() {
+        if (historyImporting) {
+            overlay?.toast("正在预加载历史，请先点击停止并保存，再分析最新对话")
+            return
+        }
+        if (analyzing || ocrBusy || historyOcrBusy) {
+            overlay?.toast("正在读取或分析，请稍候")
+            return
+        }
+        main.removeCallbacks(debounce)
+        overlay?.showLoading("正在读取当前聊天…")
+        refreshNodeCache()
+        val root = chatRoot(null)
+        val pkg = root?.packageName?.toString()
+        val adapter = adapters[pkg]
+        if (root == null || pkg == null || adapter == null) {
+            overlay?.showError("请先打开微信、小红书等支持的聊天页面，再点击分析")
+            return
+        }
+        val fresh = adapter.extract(root, resources)
+        activePkg = pkg
+        if (fresh == null) {
+            val detail = (adapter as? WeChatAdapter)?.lastDiagnostic.orEmpty()
+            overlay?.showError(if (adapter is WeChatAdapter)
+                "尚未读取到微信聊天结构。\n$detail\n$windowDiagnostic\n如果总节点只有 1，说明当前返回空节点树，无法从中读取正文；本次没有请求截图。"
+                else "尚未识别到聊天结构，请打开聊天页后重试。")
+            return
+        }
+        val identified = fresh.copy(title = if (defaultContextSelected) null else selectedContact?.name ?: fresh.title)
+        overlay?.setConversationInfo(identified.title, identified.latestFrom == "me")
+        overlay?.setRecognitionInfo("无障碍节点", identified.messages)
+        if (!identified.atLatest) {
+            overlay?.showError("当前显示的是旧消息，请先回到聊天底部，再分析最新对话")
+            return
+        }
+        if (identified.messages.isEmpty()) {
+            currentSnapshot = null
+            pendingSnapshot = null
+            if (!screenshotAllowed(pkg)) {
+                overlay?.showError(wechatDiagnostic(identified))
+            } else {
+                overlay?.showLoading("正在读取当前画面…")
+                ocrCapture(identified.title, identified.bubbleRects, pkg, manual = true)
+            }
+            return
+        }
+        currentSnapshot = identified
+        pendingSnapshot = identified
+        lastSignature = identified.signature()
+        if (prefs.historyAutoUpdate && !defaultContextSelected) submit {
+            ContextBuilder.recordVisible(this, identified, pkg)
+        }
+        runAnalysis()
+    }
+
     private fun runAnalysis() {
-        if (historyImporting) return
+        if (historyImporting) { overlay?.toast("请先停止历史预加载"); return }
         val snapshot = pendingSnapshot ?: return
-        if (analyzing) return
+        if (analyzing) { overlay?.toast("分析正在进行中"); return }
 
         if (!prefs.hasKey()) { main.post { overlay?.showError("未设置判断接口密钥，去设置里填") }; return }
         analyzing = true
+        val generation = ++analysisGeneration
+        val timeout = Runnable {
+            if (generation == analysisGeneration && analyzing) {
+                analysisGeneration++
+                analyzing = false
+                overlay?.showError("分析超时，请检查接口连接后重试")
+            }
+        }
+        main.postDelayed(timeout, 150_000L)
         main.post {
             overlay?.setConversationInfo(snapshot.title, snapshot.latestFrom == "me")
             overlay?.showLoading()
@@ -449,50 +522,86 @@ open class ChatCaptureService : AccessibilityService() {
         val client = JevClient(prefs)
         val rel = prefs.relationship
         val pkg = activePkg ?: ""
+        val useContactHistory = !defaultContextSelected
         // Knowledge context first (local file reads only, a few ms), then the two
         // network calls in parallel on the pool. A failure here must never stop
         // the analysis — it just means no extra context this round.
         submit {
             val ctx = try {
-                ContextBuilder.build(this, snapshot, pkg, prefs, useContactHistory = !defaultContextSelected)
+                ContextBuilder.build(this, snapshot, pkg, prefs, useContactHistory = useContactHistory)
             } catch (e: Exception) {
                 Log.w(TAG, "context build failed: ${e.javaClass.simpleName}"); null
             }
             main.post {
+                if (generation != analysisGeneration) return@post
                 overlay?.setContextInfo(
                     ctx?.notes?.size ?: 0,
                     ctx?.history?.size ?: 0,
                     if (ctx?.style?.isEmpty() == false) 1 else 0
                 )
-                overlay?.setHistoryInfo(ctx?.history ?: emptyList(), snapshot.messages)
             }
 
             val history = ctx?.history.orEmpty()
-            val mergedMessages = (history.map { Msg(it.side, it.text) } + snapshot.messages)
+            val labeledHistory = history.map {
+                Msg(
+                    it.side,
+                    "[${com.jev.probe.core.kb.ChatEnvironment.label(it.app)}] ${it.text}"
+                )
+            }
+            val labeledCurrent = snapshot.messages.map {
+                Msg(
+                    it.side,
+                    "[${com.jev.probe.core.kb.ChatEnvironment.label(pkg)}] ${it.text}"
+                )
+            }
+            val mergedMessages = (labeledHistory + labeledCurrent)
                 .takeLast(100)
             val analysisSnapshot = snapshot.copy(messages = mergedMessages)
+            main.post {
+                if (generation != analysisGeneration) return@post
+                overlay?.setHistoryInfo(
+                    analysisSnapshot.messages,
+                    historyCount = minOf(labeledHistory.size, (100 - labeledCurrent.size).coerceAtLeast(0)),
+                    currentCount = minOf(labeledCurrent.size, 100)
+                )
+            }
             // History is now part of the same ordered message window. Keep the
             // contact/notes background, but do not send the same history twice.
             val analysisContext = ctx?.copy(history = emptyList())
 
-            // Judgment is fast (~1s) — show it immediately.
-            submit {
-                val judgment = client.judge(analysisSnapshot, rel, analysisContext)
-                main.post {
-                    if (judgment.error != null) { analyzing = false; overlay?.showError(judgment.error) }
-                    else overlay?.showJudgment(judgment)
+            var judgmentReady = false
+            var repliesReady = false
+            var judgmentFailed = false
+            var replies = emptyList<com.jev.probe.core.RankedReply>()
+            var replyError: String? = null
+            fun finishRound() {
+                if (judgmentReady && repliesReady) {
+                    analyzing = false
+                    main.removeCallbacks(timeout)
+                    if (!judgmentFailed) overlay?.showReplies(replies, replyError) { text -> fillInput(text) }
                 }
             }
-            // Candidate replies are slower (generative + rank) — fill in when ready.
             submit {
-                var replyError: String? = null
-                    val ranked = try { client.draftAndRank(analysisSnapshot, rel, analysisContext) } catch (e: Exception) {
-                    replyError = e.message ?: e.javaClass.simpleName
-                    emptyList()
-                }
+                val result = runCatching { client.judge(analysisSnapshot, rel, analysisContext) }
                 main.post {
-                    analyzing = false
-                    overlay?.showReplies(ranked, replyError) { text -> fillInput(text) }
+                    if (generation != analysisGeneration) return@post
+                    judgmentReady = true
+                    val judgment = result.getOrNull()
+                    val error = result.exceptionOrNull()?.let { it.message ?: it.javaClass.simpleName } ?: judgment?.error
+                    judgmentFailed = judgment == null || error != null
+                    if (judgmentFailed) overlay?.showError(error ?: "判断接口未返回结果")
+                    else overlay?.showJudgment(judgment!!)
+                    finishRound()
+                }
+            }
+            submit {
+                val result = runCatching { client.draftAndRank(analysisSnapshot, rel, analysisContext) }
+                main.post {
+                    if (generation != analysisGeneration) return@post
+                    repliesReady = true
+                    replies = result.getOrDefault(emptyList())
+                    replyError = result.exceptionOrNull()?.let { it.message ?: it.javaClass.simpleName }
+                    finishRound()
                 }
             }
         }
@@ -505,7 +614,7 @@ open class ChatCaptureService : AccessibilityService() {
      * and sender sides; other apps use the generic whole-screen OCR fallback.
      */
     private fun ocrCaptureManual() {
-        val root = rootInActiveWindow
+        val root = chatRoot(null)
         val pkg = root?.packageName?.toString() ?: foregroundPkg ?: activePkg ?: ""
         // Always take a real screenshot for this explicit menu action. Adapted
         // apps can provide bubble bounds and sender sides to constrain OCR.
@@ -536,12 +645,11 @@ open class ChatCaptureService : AccessibilityService() {
         }
     }
 
-    /** WeChat is deliberately node-only: screenshot requests can trigger its
-     * global anti-capture protection and make even manual screenshots fail. */
+    /** Automatic WeChat reads use nodes; screenshots require the explicit menu action. */
     private fun screenshotAllowed(pkg: String): Boolean = pkg != "com.tencent.mm"
 
     private fun wechatDiagnostic(snapshot: ChatSnapshot): String =
-        "微信聊天页已进入；标题=${snapshot.title?.takeIf { it.isNotBlank() } ?: "未识别"}，消息节点=0。为避免再次触发微信风控，自动截屏已关闭；可用悬浮球长按菜单中的“截屏识别一次”主动验证。"
+        "${snapshot.note.orEmpty()}\n当前未读到消息正文。微信自动截图保持关闭；截图限制不影响本次无障碍读取。"
 
     /**
      * Screenshot, then either OCR each known bubble rect (Feishu: the tree knows
@@ -550,9 +658,9 @@ open class ChatCaptureService : AccessibilityService() {
      */
     private fun ocrCapture(treeTitle: String?, rects: List<BubbleRect>, pkg: String, manual: Boolean) {
         if (!manual && !screenshotAllowed(pkg)) return
-        if (ocrBusy) return
+        if (ocrBusy || historyOcrBusy) { overlay?.toast("正在识别画面，请稍候"); return }
         ocrBusy = true
-        screenCapture.capture { res ->
+        screenCapture.capture(expectedPackage = pkg, allowWeChat = manual) { res ->
             when (res) {
                 is ScreenCapture.Result.Failed -> {
                     ocrBusy = false
@@ -573,37 +681,34 @@ open class ChatCaptureService : AccessibilityService() {
                     // and overlay-settle delay. Re-read the active app now so
                     // old list-page rectangles cannot be applied to the new
                     // chat frame.
-                    val freshRoot = rootInActiveWindow
+                    val freshRoot = chatRoot(pkg)
                     val freshSnapshot = freshRoot?.takeIf {
                         it.packageName?.toString() == pkg
                     }?.let { adapters[pkg]?.extract(it, resources) }
-                    if (!manual && freshSnapshot == null) {
+                    if (freshRoot == null || !manual && freshSnapshot == null) {
                         runCatching { res.bitmap.recycle() }
                         ocrBusy = false
                         lastOcrSignature = ""
+                        if (manual) overlay?.showError("读取期间已离开原聊天应用，请返回聊天后重试")
                     } else if (freshSnapshot != null && freshSnapshot.messages.isNotEmpty()) {
                         runCatching { res.bitmap.recycle() }
                         val title = freshSnapshot.title?.takeIf { it.isNotBlank() } ?: treeTitle
                         finishOcrSnapshot(freshSnapshot.copy(title = title), pkg, manual)
                     } else {
-                    val freshTitle = freshSnapshot?.title?.takeIf { it.isNotBlank() }
-                    val effectiveTitle = if (manual) treeTitle ?: freshTitle else freshTitle ?: treeTitle
-                    val effectiveRects = freshSnapshot?.bubbleRects?.takeIf { it.isNotEmpty() } ?: rects
-                    // WeChat may hide the action-bar title from the node tree.
-                    // Read the top bar locally before reading message text.
-                    resolveOcrTitle(res.bitmap, effectiveTitle) { title ->
-                    if (effectiveRects.isNotEmpty()) {
-                        // Re-measure inside the callback. The rects handed in were
-                        // read before the 120ms overlay-hide wait and the shot
-                        // itself; one scroll tick in between and we would crop the
-                        // rows next to the ones in the picture. Fall back to the
-                        // old rects only if the tree gives us nothing now.
-                        val fresh = if (!manual) {
-                            rootInActiveWindow?.let { collectFeishuBubbleRects(it, resources) }
-                        } else null
-                        ocrByRects(res.bitmap, if (fresh.isNullOrEmpty()) effectiveRects else fresh, title, pkg, manual)
-                    } else ocrWholeScreen(res.bitmap, title, pkg, manual)
-                    }
+                        val freshTitle = freshSnapshot?.title?.takeIf { it.isNotBlank() }
+                        val effectiveTitle = if (manual) treeTitle ?: freshTitle else freshTitle ?: treeTitle
+                        val effectiveRects = freshSnapshot?.bubbleRects?.takeIf { it.isNotEmpty() } ?: rects
+                        val readMessages: (String?) -> Unit = { title ->
+                            if (effectiveRects.isNotEmpty()) {
+                                val fresh = if (!manual) {
+                                    chatRoot(pkg)?.let { collectFeishuBubbleRects(it, resources) }
+                                } else null
+                                ocrByRects(res.bitmap, if (fresh.isNullOrEmpty()) effectiveRects else fresh,
+                                    title, pkg, manual)
+                            } else ocrWholeScreen(res.bitmap, title, pkg, manual)
+                        }
+                        if (pkg == "com.tencent.mm") readMessages(selectedContact?.name)
+                        else resolveOcrTitle(res.bitmap, effectiveTitle, readMessages)
                     }
                 }
             }
@@ -757,8 +862,10 @@ open class ChatCaptureService : AccessibilityService() {
     }
 
     /** Shared tail of both OCR paths: dedupe, then analyze or park the bubble. */
-    private fun finishOcrSnapshot(snapshot: ChatSnapshot, pkg: String, manual: Boolean) {
+    private fun finishOcrSnapshot(rawSnapshot: ChatSnapshot, pkg: String, manual: Boolean) {
         ocrBusy = false
+        val snapshot = rawSnapshot.copy(title = if (defaultContextSelected) null
+            else selectedContact?.name ?: rawSnapshot.title.takeUnless { pkg == "com.tencent.mm" })
         // Counts only — OCR'd chat text never goes to logcat.
         Log.i(TAG, "ocr[$pkg] msgs=${snapshot.messages.size} manual=$manual")
         if (snapshot.messages.isEmpty()) {
@@ -886,6 +993,8 @@ open class ChatCaptureService : AccessibilityService() {
     override fun onInterrupt() {}
 
     override fun onDestroy() {
+        analysisGeneration++
+        analyzing = false
         main.removeCallbacks(historyStep)
         main.removeCallbacks(debounce)
         historySession = null
@@ -924,6 +1033,8 @@ open class ChatCaptureService : AccessibilityService() {
         }
         main.removeCallbacks(debounce)
         main.removeCallbacks(historyStep)
+        historyOcrGeneration++
+        historyOcrBusy = false
         pendingSnapshot = null
         historyImporting = true
         activePkg = pkg
@@ -937,12 +1048,30 @@ open class ChatCaptureService : AccessibilityService() {
     /** The floating window may be active; read the focused application beneath it. */
     private fun chatRoot(expectedPkg: String?): AccessibilityNodeInfo? {
         val active = rootInActiveWindow
-        if (active != null && (expectedPkg == null || active.packageName?.toString() == expectedPkg)) return active
-        return windows.firstOrNull {
-            it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION &&
-                (it.isActive || it.isFocused) &&
-                (expectedPkg == null || it.root?.packageName?.toString() == expectedPkg)
-        }?.root
+        val applicationType = android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION
+        val appWindows = windows.filter { it.type == applicationType }
+            .sortedWith(compareByDescending<android.view.accessibility.AccessibilityWindowInfo> { it.isActive || it.isFocused }
+                .thenByDescending { it.layer })
+        val foreground = if (active != null && active.window?.type == applicationType) active
+            else appWindows.firstNotNullOfOrNull { it.root }
+        val pkg = foreground?.packageName?.toString() ?: return null
+        if (pkg == packageName || expectedPkg != null && pkg != expectedPkg) return null
+        if (foreground.childCount == 0) foreground.refresh()
+        val root = if (foreground.childCount > 0) foreground else {
+            // Only inspect other windows of the same foreground app. A cached
+            // chat belonging to a background app must never become the source.
+            appWindows.asSequence().mapNotNull { it.root }
+                .filter { it.packageName?.toString() == pkg }
+                .onEach { if (it.childCount == 0) it.refresh() }
+                .firstOrNull { it.childCount > 0 } ?: foreground
+        }
+        windowDiagnostic = "应用窗口 ${appWindows.size} · 选中窗口 ${root.windowId} · 根类型 ${root.className ?: "未知"} · 根子节点 ${root.childCount}"
+        return root
+    }
+
+    private fun refreshNodeCache() {
+        lastNodeRefreshAt = SystemClock.elapsedRealtime()
+        if (android.os.Build.VERSION.SDK_INT >= 33) clearCache()
     }
 
     private fun updateHistoryProgress(session: HistoryImportSession, message: String, running: Boolean = true) {
@@ -955,11 +1084,24 @@ open class ChatCaptureService : AccessibilityService() {
         val session = historySession ?: return
         if (!historyImporting || !prefs.enabled) { stopHistoryImport(); return }
         try {
-            val root = chatRoot(session.environment)
+            var root = chatRoot(session.environment)
+            if (root?.childCount == 0 && SystemClock.elapsedRealtime() - lastNodeRefreshAt > 3000L) {
+                refreshNodeCache()
+                root = chatRoot(session.environment)
+            }
             val raw = root?.let { adapters[session.environment]?.extract(it, resources) }
+            if (session.environment == com.jev.probe.core.kb.ChatEnvironment.XHS &&
+                raw != null && raw.messages.isEmpty()
+            ) {
+                historyOcrCapture(session)
+                return
+            }
             if (raw == null || raw.messages.isEmpty()) {
                 val message = if (root == null) "等待打开所选聊天环境"
-                    else if (raw == null) "等待进入该联系人的聊天页"
+                    else if (raw == null && session.environment == "com.tencent.mm")
+                        "尚未读取到微信聊天结构。\n${(adapters[session.environment] as? WeChatAdapter)?.lastDiagnostic.orEmpty()}\n$windowDiagnostic\n若总节点只有 1，当前返回的是空节点树，并非单纯未找到输入栏；本次未请求截图。"
+                    else if (raw == null) "尚未确认聊天消息结构，请打开聊天页后重试"
+                    else if (session.environment == "com.tencent.mm") wechatDiagnostic(raw)
                     else "未读到消息节点，请检查无障碍权限或手动翻页"
                 waitForHistoryPage(session, message)
                 return
@@ -968,44 +1110,134 @@ open class ChatCaptureService : AccessibilityService() {
                 waitForHistoryPage(session, "当前不在最新消息位置，请先回到聊天底部；确认后才开始预加载")
                 return
             }
-            val keys = raw.messages.map { it.side + "\u001f" + KbStore.normalizeText(it.text) }
-            if (keys == session.lastKeys) {
-                val scroll = findHistoryScrollNode(root)
-                val moved = scroll?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) == true
-                session.awaitingScroll = moved
-                waitForHistoryPage(session, if (moved) "上一页仍在刷新，正在重试读取"
-                    else "页面未变化，请手动向上翻到更早消息；保留部分重叠消息")
-                return
-            }
-            val store = KbStore.get(this)
-            val before = store.logSize(session.contact.id, session.environment)
-            val entries = raw.messages.map {
-                com.jev.probe.core.kb.LogEntry(it.side, it.text, 0L, session.environment)
-            }
-            val ok = if (session.pages == 0) store.appendLog(session.contact.id, entries)
-                else store.prependLog(session.contact.id, entries)
-            if (!ok) { finishHistoryImport("保存失败：历史未成功写入，请检查手机存储空间"); return }
-            val added = (store.logSize(session.contact.id, session.environment) - before).coerceAtLeast(0)
-            session.added += added
-            session.duplicates += (entries.size - added).coerceAtLeast(0)
-            session.pages++
-            session.lastKeys = keys
-            session.waitingSince = SystemClock.elapsedRealtime()
-            overlay?.setRecognitionInfo("历史预加载 · 无障碍节点", raw.messages)
-            if (session.pages >= HISTORY_IMPORT_MAX_PAGES || store.logSize(session.contact.id, session.environment) >= KbStore.MAX_LOG) {
-                finishHistoryImport("本轮已完成，达到采集上限；请回到最新消息后分析")
-                return
-            }
-            val scroll = findHistoryScrollNode(root)
-            val moved = scroll?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) == true
-            session.awaitingScroll = moved
-            updateHistoryProgress(session, if (moved) "已保存本页，正在向上读取更早消息"
-                else "本页已保存，请手动向上翻页；到达最早记录后点击停止并保存")
-            main.postDelayed(historyStep, HISTORY_IMPORT_DELAY_MS)
+            consumeHistoryMessages(session, raw.messages, root, "历史预加载 · 无障碍节点")
         } catch (e: Exception) {
             Log.w(TAG, "history import failed: ${e.javaClass.simpleName}")
             finishHistoryImport("预加载出错：${e.javaClass.simpleName}，已成功保存的记录保留")
         }
+    }
+
+    /** XHS exposes the composer but draws message rows outside the node tree. */
+    private fun historyOcrCapture(session: HistoryImportSession) {
+        if (historyOcrBusy) return
+        historyOcrBusy = true
+        val generation = ++historyOcrGeneration
+        updateHistoryProgress(session, "已进入小红书聊天页，正在 OCR 读取当前历史页面")
+        screenCapture.capture(expectedPackage = session.environment,
+            isRequestValid = { generation == historyOcrGeneration && historyImporting }) { capture ->
+            when (capture) {
+                is ScreenCapture.Result.Failed -> {
+                    if (generation != historyOcrGeneration) return@capture
+                    historyOcrBusy = false
+                    updateHistoryProgress(session, "小红书历史 OCR 失败：" + capture.humanMessage)
+                    if (historyImporting && historySession === session) {
+                        main.postDelayed(historyStep, HISTORY_IMPORT_DELAY_MS)
+                    }
+                }
+                is ScreenCapture.Result.Ok -> {
+                    if (generation != historyOcrGeneration || !historyImporting || historySession !== session) {
+                        runCatching { capture.bitmap.recycle() }
+                        return@capture
+                    }
+                    ocr.scaleX = capture.scaleX
+                    ocr.scaleY = capture.scaleY
+                    ocr.originX = capture.originX
+                    ocr.originY = capture.originY
+                    val region = Rect(
+                        0,
+                        (capture.bitmap.height * TOP_CROP).toInt(),
+                        capture.bitmap.width,
+                        (capture.bitmap.height * BOTTOM_CROP).toInt()
+                    )
+                    try {
+                        ocr.recognize(capture.bitmap, region) { lines ->
+                            runCatching { capture.bitmap.recycle() }
+                            val messages = runCatching { groupOcrLines(lines) }
+                                .getOrDefault(emptyList())
+                            main.post {
+                                if (generation != historyOcrGeneration) return@post
+                                historyOcrBusy = false
+                                if (!historyImporting || historySession !== session) return@post
+                                if (messages.isEmpty()) {
+                                    waitForHistoryPage(
+                                        session,
+                                        "小红书聊天页已进入，但 OCR 没读到有效消息，请手动翻页后重试"
+                                    )
+                                } else {
+                                    consumeHistoryMessages(
+                                        session,
+                                        messages,
+                                        chatRoot(session.environment),
+                                        "历史预加载 · 小红书 OCR"
+                                    )
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        runCatching { capture.bitmap.recycle() }
+                        historyOcrBusy = false
+                        if (generation == historyOcrGeneration) {
+                            updateHistoryProgress(session, "小红书历史 OCR 出错：${e.javaClass.simpleName}")
+                            main.postDelayed(historyStep, HISTORY_IMPORT_DELAY_MS)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun consumeHistoryMessages(
+        session: HistoryImportSession,
+        messages: List<Msg>,
+        root: AccessibilityNodeInfo?,
+        source: String
+    ) {
+        if (messages.isEmpty()) {
+            waitForHistoryPage(session, "当前页面没有可保存的消息")
+            return
+        }
+        val keys = messages.map { it.side + "\u001f" + KbStore.normalizeText(it.text) }
+        if (keys == session.lastKeys) {
+            val scroll = findHistoryScrollNode(root)
+            val moved = scroll?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) == true
+            session.awaitingScroll = moved
+            waitForHistoryPage(session, if (moved) "上一页仍在刷新，正在重试读取"
+                else "页面未变化，请手动向上翻到更早消息；保留部分重叠消息")
+            return
+        }
+        val store = KbStore.get(this)
+        val before = store.logSize(session.contact.id, session.environment)
+        val entries = messages.map {
+            com.jev.probe.core.kb.LogEntry(it.side, it.text, 0L, session.environment)
+        }
+        val ok = if (session.pages == 0) store.appendLog(session.contact.id, entries)
+        else store.prependLog(session.contact.id, entries)
+        if (!ok) {
+            finishHistoryImport("保存失败：历史未成功写入，请检查手机存储空间")
+            return
+        }
+        val added = (store.logSize(session.contact.id, session.environment) - before).coerceAtLeast(0)
+        session.added += added
+        session.duplicates += (entries.size - added).coerceAtLeast(0)
+        session.pages++
+        session.lastKeys = keys
+        session.waitingSince = SystemClock.elapsedRealtime()
+        overlay?.setRecognitionInfo(source, messages)
+        if (source.contains("OCR")) {
+            overlay?.setNote("OCR 会根据消息在屏幕上的左右位置推断我方/对方，当前页面分边可能需要人工确认")
+        }
+        if (session.pages >= HISTORY_IMPORT_MAX_PAGES ||
+            store.logSize(session.contact.id, session.environment) >= KbStore.MAX_LOG
+        ) {
+            finishHistoryImport("本轮已完成，达到采集上限；请回到最新消息后分析")
+            return
+        }
+        val scroll = findHistoryScrollNode(root)
+        val moved = scroll?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) == true
+        session.awaitingScroll = moved
+        updateHistoryProgress(session, if (moved) "已保存本页，正在向上读取更早消息"
+            else "本页已保存，请手动向上翻页；到达最早记录后点击停止并保存")
+        main.postDelayed(historyStep, HISTORY_IMPORT_DELAY_MS)
     }
 
     private fun waitForHistoryPage(session: HistoryImportSession, message: String) {
@@ -1029,6 +1261,8 @@ open class ChatCaptureService : AccessibilityService() {
         val session = historySession ?: return
         historyImporting = false
         historySession = null
+        historyOcrGeneration++
+        historyOcrBusy = false
         main.removeCallbacks(historyStep)
         currentSnapshot = null
         pendingSnapshot = null

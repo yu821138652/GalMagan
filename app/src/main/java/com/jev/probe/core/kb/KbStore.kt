@@ -256,6 +256,10 @@ class KbStore private constructor(context: Context) {
 
             val tail: List<LogEntry> = when {
                 !screenBatch -> screen
+                // A manual edit changes the stored text, but not the source
+                // screen. Compare against that screen to keep corrections.
+                screenBatch && prev.isNotEmpty() && screenOverlap(prev, keys) > 0 ->
+                    screen.drop(screenOverlap(prev, keys))
                 list.isEmpty() -> screen
                 k > 0 -> screen.drop(k)
                 // Nothing in common with the screen we last wrote → we are looking
@@ -287,9 +291,36 @@ class KbStore private constructor(context: Context) {
     fun recentLog(contactId: String, n: Int, environment: String? = null): List<LogEntry> {
         if (n <= 0) return emptyList()
         synchronized(lock) {
-            val list = loadLog(contactId).filter { environment == null || it.app == environment }
-            return if (list.size <= n) list.toList()
-            else list.subList(list.size - n, list.size).toList()
+            val all = loadLog(contactId)
+            if (environment != null) {
+                val list = all.filter { it.app == environment }
+                return if (list.size <= n) list.toList()
+                else list.subList(list.size - n, list.size).toList()
+            }
+
+            // The on-disk format keeps each environment in its own contiguous
+            // block so updating WeChat does not rewrite the Xiaohongshu block.
+            // A plain takeLast(n) would therefore hide the other environment.
+            // Original chat timestamps are not available, so preserve each
+            // environment's internal order and interleave their newest windows
+            // without pretending to know the cross-app chronological order.
+            val byEnvironment = all.groupBy { it.app }.values
+                .map { entries -> entries.takeLast(n).toMutableList() }
+                .filter { it.isNotEmpty() }
+            if (byEnvironment.isEmpty()) return emptyList()
+            val result = ArrayList<LogEntry>(minOf(n, all.size))
+            var offsetFromNewest = 0
+            while (result.size < n && byEnvironment.any { offsetFromNewest < it.size }) {
+                byEnvironment.forEach { entries ->
+                    val index = entries.lastIndex - offsetFromNewest
+                    if (index >= 0 && result.size < n) {
+                        result.add(entries[index])
+                    }
+                }
+                offsetFromNewest++
+            }
+            result.reverse()
+            return result
         }
     }
 
@@ -344,6 +375,31 @@ class KbStore private constructor(context: Context) {
     }
 
     fun logSize(contactId: String, environment: String? = null): Int = allLog(contactId, environment).size
+
+    fun updateLogEntry(contactId: String, id: String, side: String, text: String): Boolean = synchronized(lock) {
+        if (side !in listOf("me", "other") || text.isBlank()) return@synchronized false
+        val entry = loadLog(contactId).firstOrNull { it.id == id } ?: return@synchronized false
+        val entries = loadLog(contactId).filter { it.app == entry.app }.map {
+            if (it.id == id) it.copy(side = side, text = text.trim()) else it
+        }
+        saveEnvironment(contactId, entry.app, entries)
+    }
+
+    fun deleteLogEntry(contactId: String, id: String): Boolean = deleteLogEntries(contactId, setOf(id))
+
+    fun deleteLogEntries(contactId: String, ids: Set<String>): Boolean = synchronized(lock) {
+        val original = loadLog(contactId)
+        if (ids.isEmpty() || !original.any { it.id in ids }) return@synchronized false
+        val remaining = original.filter { it.id !in ids }
+        val ok = writeAtomic(logFile(contactId), logJson(remaining))
+        if (ok) logCache[contactId] = remaining.toMutableList() else logCache.remove(contactId)
+        ok
+    }
+
+    private fun screenOverlap(previous: List<String>, current: List<String>): Int =
+        (minOf(previous.size, current.size) downTo 1).firstOrNull {
+            previous.takeLast(it) == current.take(it)
+        } ?: 0
 
     fun historyEnvironments(contactId: String): List<String> = synchronized(lock) {
         loadLog(contactId).map { it.app }.distinct()
@@ -495,7 +551,8 @@ class KbStore private constructor(context: Context) {
                     side = o.optString("side", "other"),
                     text = o.optString("text"),
                     ts = o.optLong("ts", 0L),
-                    app = o.optString("app")
+                    app = o.optString("app"),
+                    id = o.optString("id").ifBlank { newId() }
                 ))
             }
         }
@@ -538,6 +595,7 @@ class KbStore private constructor(context: Context) {
         val arr = JSONArray()
         list.forEach { e ->
             arr.put(JSONObject()
+                .put("id", e.id)
                 .put("side", e.side)
                 .put("text", e.text)
                 .put("ts", e.ts)

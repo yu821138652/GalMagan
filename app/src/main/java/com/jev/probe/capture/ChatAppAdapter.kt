@@ -127,141 +127,63 @@ internal fun findWeChatTitle(
     return bestCounted ?: bestPlain
 }
 
-/** WeChat (com.tencent.mm). Message bubbles carry a stable id; sender side is
- *  the bubble's horizontal position (right = me, left = other).
- *
- *  "In a chat window" = a `id/bkl` bubble container exists (even with its text
- *  stripped by the obfuscation) — nothing else counts, so a list screen's
- *  editable search box can no longer pass for a chat window (v1.3 fix: it was
- *  triggering OCR fallback on the conversation list). WeChat 8.0.52+ hides
- *  node text from ordinary services, so an empty read here (a `bkl` with no
- *  text) is exactly the case OCR fallback exists for. */
+/** WeChat uses node text only. Resource IDs can change between app versions. */
+private fun readChatNodes(root: AccessibilityNodeInfo): List<ChatTreeReader.Node> {
+    val nodes = ArrayList<ChatTreeReader.Node>()
+    val stack = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
+    stack.addLast(root to -1)
+    while (stack.isNotEmpty() && nodes.size < 6000) {
+        val (node, parent) = stack.removeLast()
+        val b = Rect(); node.getBoundsInScreen(b)
+        val index = nodes.size
+        nodes.add(ChatTreeReader.Node(
+            parent = parent, id = node.viewIdResourceName.orEmpty(),
+            text = node.text?.toString().orEmpty(),
+            description = node.contentDescription?.toString().orEmpty(),
+            hint = node.hintText?.toString().orEmpty(),
+            className = node.className?.toString().orEmpty(),
+            left = b.left, top = b.top, right = b.right, bottom = b.bottom,
+            editable = node.isEditable, visible = node.isVisibleToUser,
+            scrollable = node.isScrollable,
+            forward = node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD }
+        ))
+        for (i in node.childCount - 1 downTo 0) {
+            node.getChild(i)?.let { stack.addLast(it to index) }
+        }
+    }
+    return nodes
+}
+
 class WeChatAdapter : ChatAppAdapter {
     override val pkg = "com.tencent.mm"
+    var lastDiagnostic: String = "微信无障碍：尚未读取"
+        private set
 
     override fun extract(root: AccessibilityNodeInfo, res: Resources): ChatSnapshot? {
-        val width = res.displayMetrics.widthPixels
-        // Keep both horizontal edges. A long bubble can cross the screen
-        // midpoint, so centerX is not a reliable sender signal.
-        val bubbles = ArrayList<Bubble>()
-        val bubbleRects = ArrayList<BubbleRect>()
-        var firstBubbleTop = Int.MAX_VALUE
-        var isChat = false
-        var hasChatInput = false
-        var messageListCanScrollForward = false
-
-        val stack = ArrayDeque<AccessibilityNodeInfo>()
-        stack.addLast(root)
-        var guard = 0
-        while (stack.isNotEmpty() && guard < 5000) {
-            guard++
-            val node = stack.removeLast()
-            val id = node.viewIdResourceName
-            val text = node.text?.toString()
-            if (node.isEditable) {
-                val inputBounds = Rect(); node.getBoundsInScreen(inputBounds)
-                if (inputBounds.top > res.displayMetrics.heightPixels * 0.55f) {
-                    hasChatInput = true
-                }
-            }
-            val nb = Rect(); node.getBoundsInScreen(nb)
-            if (node.isScrollable && nb.top > res.displayMetrics.heightPixels * 0.12f &&
-                nb.bottom < res.displayMetrics.heightPixels * 0.88f
-            ) {
-                // Android exposes the currently available accessibility
-                // actions, rather than a canScrollForward property. WeChat
-                // updates this list as the message viewport reaches its end.
-                messageListCanScrollForward = messageListCanScrollForward ||
-                    node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD }
-            }
-            if (id == BUBBLE_ID) {
-                isChat = true
-                val b = Rect(); node.getBoundsInScreen(b)
-                if (b.width() > 0 && b.height() > 0) {
-                    bubbleRects.add(BubbleRect(Rect(b), wechatSide(b, width)))
-                }
-                if (!text.isNullOrBlank()) {
-                    bubbles.add(Bubble(b.top, b.left, b.right, text))
-                    if (b.top < firstBubbleTop) firstBubbleTop = b.top
-                }
-            }
-            for (i in node.childCount - 1 downTo 0) node.getChild(i)?.let { stack.addLast(it) }
+        val result = ChatTreeReader.read(readChatNodes(root), res.displayMetrics.widthPixels, res.displayMetrics.heightPixels)
+        lastDiagnostic = result.diagnostic
+        if (!result.inChat) return null
+        val rects = result.messages.map {
+            BubbleRect(Rect(it.node.left, it.node.top, it.node.right, it.node.bottom), it.side)
         }
-        // WeChat's accessibility tree can place a message body in the same
-        // action-bar region as the real title. Do not expose that guess to
-        // contact matching; the user chooses the contact explicitly.
-        val title: String? = null
-        // In a chat but nothing readable → empty snapshot, the OCR fallback cue.
-        if (bubbles.isEmpty()) {
-            bubbleRects.sortBy { it.rect.top }
-            return if (isChat && hasChatInput) ChatSnapshot(
-                title, emptyList(), bubbleRects,
-                atLatest = !messageListCanScrollForward
-            ) else null
-        }
-        if (!hasChatInput) return null
-        bubbles.sortBy { it.top }
-        val msgs = bubbles.map { b ->
-            Msg(wechatSide(Rect(b.left, b.top, b.right, b.top + 1), width), b.text)
-        }
-        return ChatSnapshot(title, msgs, atLatest = !messageListCanScrollForward)
-    }
-
-    private data class Bubble(val top: Int, val left: Int, val right: Int, val text: String)
-
-    companion object {
-        private const val BUBBLE_ID = "com.tencent.mm:id/bkl"
-        private fun wechatSide(b: Rect, width: Int): String {
-            val edge = (width * 0.13).toInt()
-            val distanceToLeftAvatar = kotlin.math.abs(b.left - edge)
-            val distanceToRightAvatar = kotlin.math.abs((width - edge) - b.right)
-            return if (distanceToRightAvatar < distanceToLeftAvatar) "me" else "other"
-        }
+        return ChatSnapshot(null, result.messages.map { Msg(it.side, it.text) }, rects,
+            note = result.diagnostic, atLatest = result.atLatest)
     }
 }
 
 /**
- * Xiaohongshu direct messages. Its message bodies vary by release and are
- * often canvas-drawn, so the adapter only identifies an open thread and lets
- * the existing local OCR path read the visible rows. The input box is the
- * important distinction from the message/list screens.
+ * Xiaohongshu reads accessible message bodies first. An empty message list
+ * allows the service to fall back to OCR for canvas-drawn versions.
  */
 class XhsAdapter : ChatAppAdapter {
     override val pkg = "com.xingin.xhs"
-
     override fun extract(root: AccessibilityNodeInfo, res: Resources): ChatSnapshot? {
-        val height = res.displayMetrics.heightPixels
-        var hasInput = false
-        var firstContentTop = Int.MAX_VALUE
-        val stack = ArrayDeque<AccessibilityNodeInfo>()
-        stack.addLast(root)
-        var guard = 0
-        while (stack.isNotEmpty() && guard < 6000) {
-            guard++
-            val node = stack.removeLast()
-            if (node.isEditable || node.className?.toString() == "android.widget.EditText") {
-                val b = Rect(); node.getBoundsInScreen(b)
-                if (b.top > height * 0.55f) hasInput = true
-            }
-            val text = node.text?.toString()?.trim()
-            if (!text.isNullOrEmpty()) {
-                val b = Rect(); node.getBoundsInScreen(b)
-                if (b.top > height * 0.12f && b.bottom < height * 0.86f &&
-                    text.length >= 2 && text.length <= 500
-                ) firstContentTop = minOf(firstContentTop, b.top)
-            }
-            for (i in node.childCount - 1 downTo 0) node.getChild(i)?.let { stack.addLast(it) }
-        }
-        if (!hasInput) return null
-        val title = findTitleInActionBar(
-            root,
-            if (firstContentTop == Int.MAX_VALUE) height else firstContentTop,
-            res.displayMetrics.widthPixels,
-            res,
-            0.15,
-            0.85
-        )
-        return ChatSnapshot(title, emptyList())
+        val result = ChatTreeReader.read(readChatNodes(root), res.displayMetrics.widthPixels,
+            res.displayMetrics.heightPixels, ChatTreeReader.App.XHS)
+        if (!result.inChat) return null
+        return ChatSnapshot(null, result.messages.map { Msg(it.side, it.text) },
+            result.messages.map { BubbleRect(Rect(it.node.left, it.node.top, it.node.right, it.node.bottom), it.side) },
+            note = result.diagnostic, atLatest = result.atLatest)
     }
 }
 
