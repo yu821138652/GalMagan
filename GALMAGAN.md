@@ -1,19 +1,17 @@
-# GalMagan
+# GalMagan 项目简介
 
-这是 `yu821138652` 维护的个人 Android 聊天辅助项目，基于上游项目二次开发，主要面向荣耀 Magic 系列手机上的微信和小红书。
+GalMagan 是由 `yu821138652` 个人维护的 Android 聊天理解与回复辅助应用，基于 [Jev Chat JARVIS](https://github.com/Finderchangchang/jev-chat-JARVIS) 二次开发。
 
-当前稳定版为 `2.0.8`，开发分支 `feature/general-model-2.0`。`v1.6.4` 保留上一阶段代码与 APK，历史稳定基线仍为 `v1.6.0`。
+当前稳定版为 `2.0.8`。应用通过无障碍服务读取聊天页面可见内容，结合联系人资料、跨应用历史和说话风格完成情境分析、风险判断及候选回复。候选只填入输入框，由用户决定是否发送。
 
-2.0 默认使用通用模型接口（目标模型 `gpt-6-luna`）顺序完成情境与风险分析、策略、候选生成和评审，Jev 为可选风险参考。新增聊天方向及本次多轮补充，不把补充写入真实历史；置信度和候选概率不再面向用户展示。
+稳定版已在荣耀 Magic7、Android 16、微信 8.0.80 上验证可以读取微信聊天消息。应用主要面向微信和小红书；兼容范围与真机验证记录见 [README](README.md) 和 [稳定版说明](STABLE.md)。
 
-1.6.4 包含联系人选择、本地历史预加载、自动更新、跨聊天环境分析、主动合成说话风格、候选回复和历史批量管理。候选回复只填入输入框，不会自动发送。
+## 项目资料
 
-当前真机反馈：小红书可以使用，微信仍需在新版真机验证。微信自动截图保持关闭；新版增加空根节点恢复和消息节点查询兜底。
+- [安装、功能、权限和构建说明](README.md)
+- [版本基线与稳定版校验值](STABLE.md)
+- [完整更新日志](CHANGELOG.md)
+- [归档与开发历史索引](docs/README.md)
+- [上游出处与许可证](NOTICE) / [LICENSE](LICENSE)
 
-- 个人仓库：<https://github.com/yu821138652/GalMagan>
-- 安装与构建：[README.md](README.md)
-- 版本与验证：[1.6.4 归档记录](docs/releases/1.6.4.md)
-- 历史基线：[STABLE.md](STABLE.md)
-- 当前开发：[2.0.3 微信空节点排查](docs/development/2.0.3.md)、[2.0.2 微信读取修复](docs/development/2.0.2.md)、[2.0.1 测试说明](docs/development/2.0.1.md)、[2.0.0 通用模型改造](docs/development/2.0.0.md)
-
-API 密钥、联系人资料和聊天历史不进入 Git 仓库。上游出处和许可证要求见 [NOTICE](NOTICE) 与 [LICENSE](LICENSE)。
+API 密钥、联系人资料和聊天历史不进入 Git 仓库。模型服务的数据处理方式由用户选择的服务商决定。
