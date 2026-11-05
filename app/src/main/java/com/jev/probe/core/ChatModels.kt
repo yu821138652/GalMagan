@@ -1,6 +1,7 @@
 package com.jev.probe.core
 
 import android.graphics.Rect
+import com.jev.probe.analysis.Situation
 
 /** One captured chat bubble. side is "me" (right) or "other" (left). */
 data class Msg(val side: String, val text: String)
@@ -41,19 +42,21 @@ data class ChatSnapshot(
 
 /** Jev's judgment result for one snapshot, plus the ranked candidate replies. */
 data class Analysis(
-    val trueIntent: Choice?,
-    val dangerLevel: Score?,
-    val sheNeeds: Choice?,
-    val shouldReplyNow: Double?,
-    val bestAction: Choice?,
-    val tensionResolved: Double?,
-    val literalQuestion: Double?,
-    val rankedReplies: List<RankedReply>,
-    val latencyMs: Long,
+    val trueIntent: Choice? = null,
+    val dangerLevel: Score? = null,
+    val sheNeeds: Choice? = null,
+    val shouldReplyNow: Double? = null,
+    val bestAction: Choice? = null,
+    val tensionResolved: Double? = null,
+    val literalQuestion: Double? = null,
+    val rankedReplies: List<RankedReply> = emptyList(),
+    val latencyMs: Long = 0,
     val error: String? = null,
-    val continuation: Boolean = false
+    val continuation: Boolean = false,
+    val situation: Situation? = null,
+    val reviewSummary: String = ""
 )
 
 data class Choice(val choice: String, val confidence: Double, val probabilities: Map<String, Double>)
 data class Score(val score: Double, val confidence: Double, val maxLevel: Int)
-data class RankedReply(val text: String, val prob: Double)
+data class RankedReply(val text: String, val prob: Double = 0.0, val approach: String = "")

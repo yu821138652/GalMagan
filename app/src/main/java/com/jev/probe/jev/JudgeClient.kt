@@ -15,7 +15,9 @@ import org.json.JSONObject
  * ranking question over already-drafted candidates. Reads judgeProvider /
  * judgeBaseUrl / judgeKey / judgeModel from [Prefs]; nothing generative here.
  */
-class JudgeClient(private val prefs: Prefs) {
+class JudgeClient(private val prefs: Prefs, private val isActive: () -> Boolean = { true },
+                  private val readTimeoutMs: Int = 40000, private val maxAttempts: Int = 3,
+                  private val cancellation: RequestCancellation? = null) {
 
     /**
      * The 7 judgment questions (fast, ~1s). Errors are returned, not thrown.
@@ -41,6 +43,8 @@ class JudgeClient(private val prefs: Prefs) {
                 rankedReplies = emptyList(),
                 latencyMs = System.currentTimeMillis() - start
             )
+        } catch (e: java.util.concurrent.CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.w(TAG, "judge failed: ${e.message}")
             Analysis(null, null, null, null, null, null, null, emptyList(),
@@ -84,7 +88,7 @@ class JudgeClient(private val prefs: Prefs) {
         return try {
             send(JevQuestions.buildState(snapshot, relationship, background, history), questions)
         } catch (e: ApiException) {
-            if (enriched && e.status != null && e.status in 400..499) {
+            if (enriched && e.status in listOf(400, 422)) {
                 Log.w(TAG, "judge HTTP ${e.status} with background/history; retrying plain")
                 send(JevQuestions.buildState(snapshot, relationship), questions)
             } else throw e
@@ -97,7 +101,8 @@ class JudgeClient(private val prefs: Prefs) {
             .put("model", prefs.judgeModel)
             .put("state", state)
             .put("questions", questions)
-        val resp = HttpJson.post(url, prefs.judgeKey, body, Route.JUDGE, HttpJson.headersFor(url))
+        val resp = HttpJson.post(url, prefs.judgeKey, body, Route.JUDGE, HttpJson.headersFor(url),
+            readTimeoutMs = readTimeoutMs, maxAttempts = maxAttempts, isActive = isActive, cancellation = cancellation)
         return resp.optJSONObject("answers") ?: JSONObject()
     }
 

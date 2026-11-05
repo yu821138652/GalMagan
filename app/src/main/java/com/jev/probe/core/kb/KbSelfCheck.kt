@@ -72,6 +72,7 @@ object KbSelfCheck {
                 Msg("me", "自检消息二：这条也够长")
             ))
 
+            ContextBuilder.recordVisible(context, snapshot, "com.jev.probe", contactId)
             // 1. contact hit via full-width alias + member-count stripping
             val ctx1 = ContextBuilder.build(context, snapshot, "com.jev.probe", prefs)
             if (ctx1.contact?.id != contactId)
@@ -104,10 +105,10 @@ object KbSelfCheck {
             if (!background.contains("小蓝")) failures.add("background 里没有笔记正文")
             if (!background.contains("自检用的关系描述")) failures.add("background 里没有联系人关系")
 
-            // 6. history is off by default (opt-in only)
-            prefs.contextEnabled = false
-            if (ContextBuilder.build(context, snapshot, "com.jev.probe", prefs).history.isNotEmpty())
-                failures.add("contextEnabled=false 时仍注入了历史")
+            // Default mode must not read any matched contact or their history.
+            val defaultContext = ContextBuilder.build(context, snapshot, "com.jev.probe", prefs, useContactHistory = false)
+            if (defaultContext.contact != null || defaultContext.history.isNotEmpty())
+                failures.add("默认模式引用了联系人历史")
         } catch (e: Exception) {
             failures.add("异常：${e.javaClass.simpleName} ${e.message ?: ""}")
         } finally {

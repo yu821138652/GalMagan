@@ -104,6 +104,16 @@ class ChatTreeReaderTest {
         assertEquals("输入栏不可见的正文", result.messages.single().text)
     }
 
+    @Test fun queriedMessageNodesWithOnlyAProviderRootStillCountAsChat() {
+        val nodes = listOf(
+            node(parent = -1, cls = "android.widget.FrameLayout", left = 0, top = 0, right = 1000, bottom = 2000),
+            node(parent = 0, id = "com.tencent.mm:id/bkl", text = "查询到的微信消息", left = 140, top = 700, bottom = 760)
+        )
+        val result = ChatTreeReader.read(nodes, 1000, 2000)
+        assertTrue(result.diagnostic, result.inChat)
+        assertEquals(listOf("查询到的微信消息"), result.messages.map { it.text })
+    }
+
     @Test fun fullWidthComposerAndKeyboardRaisedComposerAreAccepted() {
         val nodes = base()
         nodes[1] = nodes[1].copy(left = 0, right = 1000, top = 700, bottom = 780)

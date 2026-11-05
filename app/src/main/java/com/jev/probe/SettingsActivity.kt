@@ -20,6 +20,9 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import android.widget.Spinner
+import android.widget.ArrayAdapter
+import android.widget.AdapterView
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.switchmaterial.SwitchMaterial
 import com.jev.probe.core.ChatSnapshot
@@ -30,6 +33,9 @@ import com.jev.probe.core.kb.KbStore
 import com.jev.probe.jev.JudgeClient
 import com.jev.probe.jev.ReplyClient
 import com.jev.probe.jev.VisionClient
+import com.jev.probe.analysis.ChatDirection
+import com.jev.probe.analysis.ConversationInput
+import com.jev.probe.analysis.GeneralAnalysisClient
 import java.util.concurrent.Executors
 import kotlin.math.roundToInt
 
@@ -68,14 +74,27 @@ class SettingsActivity : AppCompatActivity() {
         root.addView(header("设置"))
         root.addView(text("控制接口、分析行为、历史记录和悬浮窗显示。修改后点击底部保存。",
             12f, sub).apply { setPadding(0, dp(2), 0, dp(6)) })
+        root.addView(text("当前版本 ${com.jev.probe.BuildConfig.VERSION_NAME}", 11f, sub).apply {
+            setPadding(0, 0, 0, dp(4))
+        })
 
         // =================== 接口 ===================
         root.addView(section("接口"))
 
+        var analysisMode = prefs.analysisMode
+        root.addView(label("分析模式"))
+        val modePicker = Spinner(this).apply {
+            adapter = ArrayAdapter(this@SettingsActivity, android.R.layout.simple_spinner_dropdown_item,
+                listOf("通用模型（无需 Jev）", "通用模型 + Jev 辅助（可选）"))
+            setSelection(if (analysisMode == Prefs.MODE_JEV_ASSISTED) 1 else 0)
+            minimumHeight = dp(48)
+        }
+        root.addView(modePicker)
+
         // --- 判断接口（Jev） ---
         val judgeCard = card()
-        judgeCard.addView(cardTitle("判断接口（Jev）"))
-        judgeCard.addView(text("读对方消息、给意图判断和候选排序。必须配置。", 12f, sub))
+        judgeCard.addView(cardTitle("Jev 辅助接口（可选）"))
+        judgeCard.addView(text("仅提供风险参考。未配置、无余额或请求失败时，仍由通用模型完成整个流程。", 12f, sub))
 
         val judgeBaseEdit = edit(prefs.judgeBaseUrl, Prefs.DEFAULT_JUDGE_BASE_OPENROUTER)
         val judgeModelEdit = edit(prefs.judgeModel, Prefs.DEFAULT_JUDGE_MODEL_OPENROUTER)
@@ -142,19 +161,26 @@ class SettingsActivity : AppCompatActivity() {
                 val ms = System.currentTimeMillis() - t0
                 main.post {
                     judgeResult.text = if (a.error != null) "失败（${ms}ms）：${a.error}"
-                    else "成功 ${ms}ms · 意图=${a.trueIntent?.choice ?: "?"}" +
-                        "（置信 ${pct(a.trueIntent?.confidence)}）"
+                    else "成功 ${ms}ms · 风险参考=${a.dangerLevel?.score ?: "未返回"}/9"
                 }
             }
         })
         judgeCard.addView(judgeResult)
         makeCollapsible(judgeCard)
         root.addView(judgeCard)
+        judgeCard.visibility = if (analysisMode == Prefs.MODE_JEV_ASSISTED) View.VISIBLE else View.GONE
+        modePicker.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                analysisMode = if (position == 1) Prefs.MODE_JEV_ASSISTED else Prefs.MODE_GENERAL
+                judgeCard.visibility = if (position == 1) View.VISIBLE else View.GONE
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
 
         // --- 回复接口 ---
         val replyCard = card()
-        replyCard.addView(cardTitle("回复接口"))
-        replyCard.addView(text("生成 3 条候选回复。任何 OpenAI 兼容地址，填到 /v1 为止。", 12f, sub))
+        replyCard.addView(cardTitle("通用模型接口"))
+        replyCard.addView(text("情境、风险、策略、候选及评审共用此接口。使用中转站提供的地址和模型 ID。", 12f, sub))
 
         val replyBaseEdit = edit(prefs.replyBaseUrl, Prefs.DEFAULT_REPLY_BASE)
         val replyModelEdit = edit(prefs.replyModel, Prefs.DEFAULT_REPLY_MODEL)
@@ -175,11 +201,11 @@ class SettingsActivity : AppCompatActivity() {
         replyCard.addView(label("Base URL"))
         replyCard.addView(replyBaseEdit)
         replyCard.addView(label("密钥"))
-        replyCard.addView(edit(prefs.replyKey, "留空则用判断接口密钥", password = true).also { replyKeyEdit = it })
+        replyCard.addView(edit(prefs.replyKey, "填写此通用模型接口的密钥", password = true).also { replyKeyEdit = it })
         replyCard.addView(label("模型"))
         replyCard.addView(replyModelEdit)
         val replyResult = resultText()
-        replyCard.addView(cardBtn("测试回复") {
+        replyCard.addView(cardBtn("测试连接") {
             val base = replyBaseEdit.text.toString().trim()
             val model = replyModelEdit.text.toString().trim()
             val probe = draftPrefs(SCRATCH_REPLY) {
@@ -188,7 +214,7 @@ class SettingsActivity : AppCompatActivity() {
                 replyKey = replyKeyEdit.text.toString().trim()
                 replyModel = model.ifBlank { Prefs.DEFAULT_REPLY_MODEL }
             }
-            if (probe.effectiveReplyKey().isBlank()) { replyResult.text = "请先填密钥（或填判断接口密钥）"; return@cardBtn }
+            if (probe.analysisConfigError() != null) { replyResult.text = probe.analysisConfigError(); return@cardBtn }
             replyResult.text = "测试中…"
             worker.execute {
                 val t0 = System.currentTimeMillis()
@@ -200,6 +226,33 @@ class SettingsActivity : AppCompatActivity() {
                 main.post {
                     replyResult.text = if (err != null) "失败（${ms}ms）：$err"
                     else "成功 ${ms}ms · 返回：${out.replace("\n", " ").take(60)}"
+                }
+            }
+        })
+        replyCard.addView(cardBtn("测试完整分析") {
+            val probe = draftPrefs(SCRATCH_REPLY + "_pipeline") {
+                replyBaseUrl = replyBaseEdit.text.toString().trim()
+                replyKey = replyKeyEdit.text.toString().trim()
+                replyModel = replyModelEdit.text.toString().trim()
+                this.analysisMode = analysisMode
+                judgeProvider = resolveJudgeProvider(judgeProviderIdx, judgeBaseEdit.text.toString())
+                judgeBaseUrl = judgeBaseEdit.text.toString().trim()
+                judgeModel = judgeModelEdit.text.toString().trim()
+                judgeKey = judgeKeyEdit.text.toString().trim()
+            }
+            if (probe.analysisConfigError() != null) { replyResult.text = probe.analysisConfigError(); return@cardBtn }
+            replyResult.text = "完整流程测试中…"
+            worker.execute {
+                val demo = ChatSnapshot(null, listOf(Msg("me", "今天那家店的甜点怎么样？"), Msg("other", "挺好吃的，下次一起去吧")))
+                val input = ConversationInput.build(demo, null, "com.xingin.xhs", "朋友", ChatDirection.DEFAULT, emptyList())
+                val result = runCatching {
+                    GeneralAnalysisClient(probe).analyze(input, { !isDestroyed },
+                        { status -> main.post { replyResult.text = status } }, {})
+                }
+                main.post {
+                    replyResult.text = result.fold(
+                        { "完整流程成功 · 风险 ${it.situation?.riskLevel}/9 · 已检查候选 ${it.rankedReplies.size} 条\n${it.situation?.topic}" },
+                        { "完整流程失败：${it.message}" })
                 }
             }
         })
@@ -269,7 +322,7 @@ class SettingsActivity : AppCompatActivity() {
         // =================== 分析 ===================
         root.addView(section("分析"))
         val card2 = card()
-        card2.addView(label("关系描述（给 Jev 判断用）"))
+        card2.addView(label("默认关系描述"))
         val relEdit = edit(prefs.relationship, Prefs.DEFAULT_REL)
         card2.addView(relEdit)
         card2.addView(label("会话白名单（每行一个关键词，空=所有会话）"))
@@ -283,7 +336,7 @@ class SettingsActivity : AppCompatActivity() {
         // --- OCR 兜底（B 阶段）---
         val ocrFallbackRow = toggleRow("树读不到正文时用 OCR 兜底", prefs.ocrFallback)
         card2.addView(ocrFallbackRow)
-        card2.addView(text("飞书正文是画上去的、微信伪装失效时也读不到，这时截一次屏本地识别（不上传）。", 11f, sub))
+        card2.addView(text("消息节点为空时可本地识别画面；微信不自动截图，保留手动截屏入口。", 11f, sub))
         val ocrAutoRow = toggleRow("OCR 模式自动分析", prefs.ocrAutoAnalyze)
         card2.addView(ocrAutoRow)
         card2.addView(text("关闭时 OCR 认完只亮悬浮球，点一下再分析。", 11f, sub))
@@ -359,6 +412,7 @@ class SettingsActivity : AppCompatActivity() {
 
         // =================== 保存 ===================
         root.addView(primaryBtn("保存全部设置") {
+            prefs.analysisMode = analysisMode
             // Address wins over the pill: a preset HOST in the box means that
             // preset's provider (and so its path), whatever the pill last said.
             val judgeBaseTyped = judgeBaseEdit.text.toString().trim()
@@ -508,9 +562,6 @@ class SettingsActivity : AppCompatActivity() {
         bmp.eraseColor(Color.WHITE)
         return VisionClient.encodeJpeg(bmp)
     }
-
-    private fun pct(d: Double?): String =
-        if (d == null) "?" else "${(d * 100).roundToInt()}%"
 
     /** Horizontal selectable pills; calls [onPick] with the chosen index. */
     private fun pills(options: List<String>, initial: Int, onPick: (Int) -> Unit): View {

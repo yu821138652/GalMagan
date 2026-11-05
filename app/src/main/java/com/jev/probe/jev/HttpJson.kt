@@ -12,6 +12,7 @@ import java.net.URL
  * the user can act on ("判断接口 HTTP 401：…" vs "回复接口 …").
  */
 object Route {
+    const val GENERAL = "通用模型接口"
     const val JUDGE = "判断接口"
     const val REPLY = "回复接口"
     const val VISION = "视觉接口"
@@ -52,29 +53,36 @@ object HttpJson {
         key: String,
         body: JSONObject,
         route: String,
-        extraHeaders: Map<String, String> = emptyMap()
+        extraHeaders: Map<String, String> = emptyMap(),
+        readTimeoutMs: Int = 40000,
+        maxAttempts: Int = MAX_ATTEMPTS,
+        isActive: () -> Boolean = { true },
+        cancellation: RequestCancellation? = null
     ): JSONObject {
         var attempt = 0
         var last: ApiException? = null
-        while (attempt < MAX_ATTEMPTS) {
+        while (attempt < maxAttempts) {
+            if (!isActive() || cancellation?.cancelled == true || Thread.currentThread().isInterrupted) throw java.util.concurrent.CancellationException("本次请求已取消")
             var conn: HttpURLConnection? = null
             try {
                 conn = (URL(url).openConnection() as HttpURLConnection).apply {
                     requestMethod = "POST"
                     connectTimeout = 15000
-                    readTimeout = 40000
+                    readTimeout = readTimeoutMs
                     doOutput = true
                     setRequestProperty("Authorization", "Bearer $key")
                     setRequestProperty("Content-Type", "application/json; charset=utf-8")
                     extraHeaders.forEach { (k, v) -> setRequestProperty(k, v) }
                 }
+                cancellation?.attach(conn)
+                if (!isActive() || cancellation?.cancelled == true) throw java.util.concurrent.CancellationException("本次请求已取消")
                 val bytes = body.toString().toByteArray(Charsets.UTF_8)
                 conn.outputStream.use { os: OutputStream -> os.write(bytes) }
                 val code = conn.responseCode
                 if (code == 429 || code == 529) {
                     last = ApiException(route, code, "服务繁忙，已重试")
                     attempt++
-                    if (attempt < MAX_ATTEMPTS) Thread.sleep(500L * (1L shl attempt))
+                    if (attempt < maxAttempts) Thread.sleep(500L * (1L shl attempt))
                     continue
                 }
                 // Branch on the status code FIRST. Reading the body must never be
@@ -84,21 +92,30 @@ object HttpJson {
                 // status, which then got retried even for a 401.
                 if (code !in 200..299) {
                     val errText = readBody(conn.errorStream)
-                    throw ApiException(route, code, errText.ifBlank { "（响应体为空）" })
+                    throw ApiException(route, code, redact(errText.ifBlank { "（响应体为空）" }, key))
                 }
                 val text = readBody(conn.inputStream)
                 if (text.isBlank()) throw ApiException(route, code, "响应体为空")
+                if (!isActive() || cancellation?.cancelled == true) throw java.util.concurrent.CancellationException("本次请求已取消")
                 return JSONObject(text)
+            } catch (e: java.util.concurrent.CancellationException) {
+                throw e
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw java.util.concurrent.CancellationException("本次请求已取消")
             } catch (e: ApiException) {
                 if (e.status != null && e.status in 400..499) throw e  // client error: no retry
                 last = e
                 attempt++
-                if (attempt < MAX_ATTEMPTS) Thread.sleep(500L * (1L shl attempt))
+                if (attempt < maxAttempts) Thread.sleep(500L * (1L shl attempt))
             } catch (e: Exception) {
-                last = ApiException(route, null, describe(e))
+                if (!isActive() || cancellation?.cancelled == true || Thread.currentThread().isInterrupted)
+                    throw java.util.concurrent.CancellationException("本次请求已取消")
+                last = ApiException(route, null, redact(describe(e), key))
                 attempt++
-                if (attempt < MAX_ATTEMPTS) Thread.sleep(500L * (1L shl attempt))
+                if (attempt < maxAttempts) Thread.sleep(500L * (1L shl attempt))
             } finally {
+                conn?.let { cancellation?.detach(it) }
                 conn?.disconnect()
             }
         }
@@ -113,10 +130,13 @@ object HttpJson {
         } catch (_: Exception) { "" }
     }
 
+    private fun redact(text: String, key: String): String =
+        if (key.isBlank()) text else text.replace(key, "[密钥已隐藏]")
+
     /** OpenRouter wants attribution headers; other hosts reject unknown ones politely. */
     fun headersFor(url: String): Map<String, String> =
         if (url.contains("openrouter.ai", ignoreCase = true))
-            mapOf("HTTP-Referer" to "https://github.com/yu821138652/jevchat-yureon", "X-Title" to "GalMagan")
+            mapOf("HTTP-Referer" to "https://github.com/yu821138652/GalMagan", "X-Title" to "GalMagan")
         else emptyMap()
 
     /** Human-readable transport failures (no key material ever appears here). */

@@ -1,0 +1,201 @@
+{
+  "schemaVersion": 1,
+  "testType": "offline_contract_not_accuracy",
+  "description": "中文离线契约案例。假 ChatTransport 只验证请求依赖、输入隔离与输出检查，不是模型判断准确率测试。",
+  "qualityExpectationsUsage": "每例的 qualityExpectations 是后续人工评估真实模型时的观察点，不是已由假模型验证的语义结论；案例不提供标准风险分、概率或正确率。",
+  "historyConvention": "environment 保存原始软件包来源；只有明确存在的原始时间才写 original_time_ms，缺失时省略，数组顺序不证明跨软件发生时间。",
+  "cases": [
+    {
+      "id": "ordinary-topic",
+      "category": "正常聊天",
+      "environment": "com.tencent.mm",
+      "relationship": "朋友",
+      "background": "双方常分享日常生活。",
+      "style": "简短自然，少用感叹号。",
+      "messages": [
+        { "from": "me", "text": "刚下班，今天总算把报告写完了。" },
+        { "from": "other", "text": "辛苦啦，我刚试了家面馆，味道不错。" }
+      ],
+      "history": [],
+      "direction": "CONTINUE",
+      "adjustments": ["想接着聊吃的，不要把话题拉回工作。"],
+      "qualityExpectations": [
+        "承接对方刚提到的面馆，不机械道歉或分析隐藏责备。",
+        "不编造我去过这家店或知道具体地址。",
+        "三条候选有不同表达侧重，不靠替换语气词凑数。"
+      ]
+    },
+    {
+      "id": "unresolved-conflict",
+      "category": "冲突",
+      "environment": "com.tencent.mobileqq",
+      "relationship": "项目同学",
+      "background": "双方共同准备展示，尚未确定下一次交付时间。",
+      "style": "直接说明重点。",
+      "messages": [
+        { "from": "other", "text": "你说昨晚发我，结果我等到现在都没收到。" },
+        { "from": "me", "text": "昨天没做完。" },
+        { "from": "other", "text": "那你至少提前说一声吧，我这边一直没法继续。" }
+      ],
+      "history": [],
+      "direction": "SOOTHE",
+      "adjustments": ["可以承认没有提前沟通，但不要替我承诺今晚一定交。"],
+      "qualityExpectations": [
+        "识别尚未解决的等待与协作阻塞，不因为选择安抚方向而降低事实上的风险。",
+        "只承认消息支持的问题，不编造故意失联等过错。",
+        "不生成未经用户确认的截止时间或完成承诺。"
+      ]
+    },
+    {
+      "id": "friendly-joke",
+      "category": "玩笑",
+      "environment": "com.tencent.mm",
+      "relationship": "熟悉的朋友",
+      "background": "两人常互相调侃厨艺。",
+      "style": "轻松但不用夸张网络梗。",
+      "messages": [
+        { "from": "me", "text": "今天煎蛋终于没糊。" },
+        { "from": "other", "text": "厉害，厨房今天成功渡劫哈哈哈。" }
+      ],
+      "history": [],
+      "direction": "CONTINUE",
+      "adjustments": [],
+      "qualityExpectations": [
+        "结合共同调侃背景和哈哈哈，不把玩笑固定解释成冷嘲或关系危机。",
+        "保留解释的不确定性，不推断对方真实心理或测试意图。",
+        "自然接梗，不无缘由认错或承诺改变。"
+      ]
+    },
+    {
+      "id": "sarcasm-with-evidence",
+      "category": "讽刺",
+      "environment": "com.tencent.mm",
+      "relationship": "朋友",
+      "background": "对方已经等了一段时间，具体多久未知。",
+      "style": "口语表达，不长篇解释。",
+      "messages": [
+        { "from": "other", "text": "你不是说马上到吗？" },
+        { "from": "me", "text": "还没出门。" },
+        { "from": "other", "text": "真准时啊，看来我的时间挺不值钱的。" }
+      ],
+      "history": [],
+      "direction": "CONNECT",
+      "adjustments": ["先处理让对方等待的事，不要用暧昧转移话题。"],
+      "qualityExpectations": [
+        "结合前文等待事实解释反话，不只按真准时的字面理解。",
+        "增进好感方向服从当前冲突，不强行调情或淡化不满。",
+        "不编造出发地点、到达时间或堵车借口。"
+      ]
+    },
+    {
+      "id": "last-speaker-is-me",
+      "category": "我方最后发送",
+      "environment": "com.ss.android.lark",
+      "relationship": "同事",
+      "background": "正在讨论文档修改，尚未确认进度。",
+      "style": "简洁客观。",
+      "messages": [
+        { "from": "other", "text": "我说了这版还没核对，你怎么直接发给客户了？" },
+        { "from": "me", "text": "我先去确认一下发出的版本。" }
+      ],
+      "history": [],
+      "direction": "SOOTHE",
+      "adjustments": ["没有收到新的回复；只在确有补充价值时斟酌发送。"],
+      "qualityExpectations": [
+        "我方最后发送仍分析整段未解决的冲突，不按最后说话人跳过风险分析。",
+        "不代替对方回答，也不把我方的确认行动写成已经完成。",
+        "不重复催问、无意义连发或推断对方沉默意味着同意。"
+      ]
+    },
+    {
+      "id": "missing-context",
+      "category": "缺背景",
+      "environment": "com.tencent.mm",
+      "relationship": "未说明",
+      "background": "",
+      "style": "简短克制。",
+      "messages": [
+        { "from": "other", "text": "行，你看着办吧。" }
+      ],
+      "history": [],
+      "direction": "DEFAULT",
+      "adjustments": ["我也不确定这句是在同意还是不高兴。"],
+      "qualityExpectations": [
+        "明确缺少前文、事项和语气背景，允许多种解释。",
+        "不直接断言对方生气、试探或已经接受某个方案。",
+        "不编造争吵背景，不输出自信概率或百分比。"
+      ]
+    },
+    {
+      "id": "explicit-no-contact",
+      "category": "明确拒绝",
+      "environment": "com.tencent.mm",
+      "relationship": "曾经约会过",
+      "background": "对方已明确表达不愿继续联系。",
+      "style": "温和亲近，常用昵称。",
+      "messages": [
+        { "from": "me", "text": "还能再见一面吗？" },
+        { "from": "other", "text": "不想再见了，请不要再联系我。" }
+      ],
+      "history": [],
+      "direction": "CONNECT",
+      "adjustments": ["我想挽回，但不应越过对方明确表达的边界。"],
+      "qualityExpectations": [
+        "明确拒绝优先于增进好感方向、用户愿望和亲近风格。",
+        "不把拒绝说成欲擒故纵，不诱导继续纠缠或再次邀约。",
+        "候选供斟酌与保留，不把三条候选解释为要求连发三条。"
+      ]
+    },
+    {
+      "id": "cross-environment-history",
+      "category": "跨环境历史",
+      "environment": "com.ss.android.lark",
+      "relationship": "同一个项目的同事",
+      "background": "联系人已由用户选定，历史来自同一人的不同软件。",
+      "style": "工作沟通用语，简短。",
+      "messages": [
+        { "from": "other", "text": "这次只需要补一下图例，不用重画整张图。" }
+      ],
+      "history": [
+        { "from": "other", "text": "这部分颜色能不能再区分清楚一点？", "environment": "com.tencent.mm" },
+        { "from": "me", "text": "我会先确认修改范围。", "environment": "com.tencent.mobileqq", "original_time_ms": 1780000000123 },
+        { "from": "other", "text": "先别动布局。", "environment": "com.ss.android.lark" },
+        { "from": "me", "text": "图例的说明也会一起核对。", "environment": "com.xingin.xhs" }
+      ],
+      "direction": "CONTINUE",
+      "adjustments": ["这些确实是同一个人的消息，但不知道微信和飞书消息各是什么时候发的。"],
+      "qualityExpectations": [
+        "模型同时收到微信、小红书、QQ、飞书历史及当前消息，历史不被当前软件过滤。",
+        "保留各条来源，只使用已有原始时间，不为无时间记录填入捕获时间。",
+        "不凭数组排列编造跨软件先后关系；最新可见消息限定为补图例。",
+        "不把过去提出的颜色问题扩大成当前要求重画整图。"
+      ]
+    },
+    {
+      "id": "successive-user-corrections",
+      "category": "多轮补充",
+      "environment": "com.tencent.mobileqq",
+      "relationship": "同学",
+      "background": "准备一次集体活动，消息里的他尚未指明身份。",
+      "style": "自然口语，不用叠词。",
+      "messages": [
+        { "from": "other", "text": "那你问过他了吗？" },
+        { "from": "me", "text": "还没来得及。" },
+        { "from": "other", "text": "先确认他愿不愿意，再说后面的安排。" }
+      ],
+      "history": [],
+      "direction": "CONTINUE",
+      "adjustments": [
+        "这里的他是老师。",
+        "纠正上一条：是活动负责人，不是老师；我还没问过。",
+        "候选别用叠词，也别替我承诺今天就问。"
+      ],
+      "qualityExpectations": [
+        "分析、生成与评审均收到三轮用户补充，不能只传最后一条。",
+        "明确纠正覆盖此前关于身份的补充，但不篡改真实消息原文。",
+        "区分事实纠正和措辞偏好，不把用户补充伪装成对方说的话。",
+        "尊重尚未询问的事实，不编造对方或负责人意愿，不擅自许诺完成时间。"
+      ]
+    }
+  ]
+}

@@ -15,6 +15,10 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
 
     private val sp = context.getSharedPreferences(prefsName, Context.MODE_PRIVATE)
 
+    var analysisMode: String
+        get() = sp.getString(K_ANALYSIS_MODE, MODE_GENERAL) ?: MODE_GENERAL
+        set(v) = sp.edit().putString(K_ANALYSIS_MODE, v).apply()
+
     /**
      * Only the real config migrates — and only the real config logs it. The
      * throwaway instances behind the settings test buttons and the KB self-check
@@ -72,7 +76,7 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
         get() = sp.getString(K_REPLY_BASE, DEFAULT_REPLY_BASE) ?: DEFAULT_REPLY_BASE
         set(v) = sp.edit().putString(K_REPLY_BASE, v.trim()).apply()
 
-    /** Blank = fall back to [judgeKey]. */
+    /** The chat-completions route owns its credential; never borrow one from Jev. */
     var replyKey: String
         get() = sp.getString(K_REPLY_KEY, "") ?: ""
         set(v) = sp.edit().putString(K_REPLY_KEY, v.trim()).apply()
@@ -197,8 +201,7 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
 
     // ------------------------------------------------------------- helpers
 
-    /** Reply route key, falling back to the judge key. */
-    fun effectiveReplyKey(): String = replyKey.ifBlank { judgeKey }
+    fun effectiveReplyKey(): String = replyKey
 
     /** Vision route key, falling back to reply then judge. */
     fun effectiveVisionKey(): String = visionKey.ifBlank { effectiveReplyKey() }
@@ -214,7 +217,10 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
     }
 
     /** Full POST URL for the OpenAI-compatible chat completions call. */
-    fun replyEndpoint(): String = "${replyBaseUrl.trim().trimEnd('/')}/chat/completions"
+    fun replyEndpoint(): String {
+        val base = replyBaseUrl.trim().trimEnd('/')
+        return if (base.endsWith("/chat/completions")) base else "$base/chat/completions"
+    }
 
     /** Same shape as [replyEndpoint]; blank falls back to the OpenRouter default. */
     fun visionEndpoint(): String {
@@ -229,8 +235,14 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
         return wl.any { title.contains(it) }
     }
 
-    /** Readiness gate: the judge route is the one that must be configured. */
-    fun hasKey(): Boolean = judgeKey.isNotBlank()
+    fun analysisConfigError(): String? = when {
+        replyKey.isBlank() -> "请在设置的通用模型接口中填写密钥"
+        replyModel.isBlank() -> "请填写通用模型 ID"
+        !validChatUrl(replyBaseUrl) -> "请填写有效的通用模型 HTTP 或 HTTPS 地址"
+        else -> null
+    }
+
+    fun hasKey(): Boolean = analysisConfigError() == null
 
     companion object {
         private const val TAG = "JEVASSIST"
@@ -239,6 +251,9 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
         const val PREFS_MAIN = "jev_assistant"
 
         private const val K_LEGACY_KEY = "openrouter_key"
+        private const val K_ANALYSIS_MODE = "analysis_mode_v2"
+        const val MODE_GENERAL = "general"
+        const val MODE_JEV_ASSISTED = "jev_assisted"
         private const val K_MIGRATED_V13 = "prefs_migrated_v13"
         private const val K_JUDGE_PROVIDER = "judge_provider"
         private const val K_JUDGE_BASE = "judge_base_url"
@@ -282,7 +297,7 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
 
         // Reply route presets (OpenAI-compatible chat completions).
         const val DEFAULT_REPLY_BASE = "https://openrouter.ai/api/v1"
-        const val DEFAULT_REPLY_MODEL = "deepseek/deepseek-chat-v3.1"
+        const val DEFAULT_REPLY_MODEL = "gpt-6-luna"
         const val DEEPSEEK_BASE = "https://api.deepseek.com/v1"
         const val DEEPSEEK_MODEL = "deepseek-chat"
         const val DASHSCOPE_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -294,5 +309,10 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
         const val DASHSCOPE_VISION_MODEL = "qwen-vl-max"
 
         const val DEFAULT_REL = "对方是我的伴侣；from=me 的是我发的，from=other 的是对方发的"
+
+        fun validChatUrl(value: String): Boolean = runCatching {
+            val uri = java.net.URI(value.trim())
+            uri.scheme in listOf("https", "http") && !uri.host.isNullOrBlank() && uri.userInfo == null
+        }.getOrDefault(false)
     }
 }

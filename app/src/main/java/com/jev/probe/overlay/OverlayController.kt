@@ -22,6 +22,15 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import android.widget.EditText
+import android.widget.ImageButton
+import android.widget.Spinner
+import android.widget.ArrayAdapter
+import android.widget.AdapterView
+import android.view.inputmethod.InputMethodManager
+import android.text.InputFilter
+import android.view.KeyEvent
+import com.jev.probe.analysis.ChatDirection
 import com.jev.probe.core.Analysis
 import com.jev.probe.core.ChatSnapshot
 import com.jev.probe.core.Prefs
@@ -50,6 +59,24 @@ class OverlayController(private val ctx: Context) {
     private var lp: WindowManager.LayoutParams? = null
 
     var onManualAnalyze: (() -> Unit)? = null
+    var onStopAnalysis: (() -> Unit)? = null
+    var onRefresh: (() -> Unit)? = null
+    private var stopAnalysisButton: View? = null
+    var onDirectionChanged: ((ChatDirection) -> Unit)? = null
+    var onAdjustment: ((String) -> Unit)? = null
+    var onClearAdjustments: (() -> Unit)? = null
+    private var directionPicker: Spinner? = null
+    private var adjustmentEdit: EditText? = null
+    private var adjustmentControls: LinearLayout? = null
+    private var submitAdjustment: ImageButton? = null
+    private var clearAdjustments: ImageButton? = null
+    private var adjustmentCount: TextView? = null
+    private var analysisScroll: ScrollView? = null
+    private var selectedDirection = ChatDirection.DEFAULT
+    private var sessionAdjustments: List<String> = emptyList()
+    private var editingAdjustment = false
+    private var adjustmentSettlesAt = 0L
+    private var analysisBusy = false
 
     /** Contact selected when automatic title extraction is wrong or missing. */
     var onContactSelected: ((Contact) -> Unit)? = null
@@ -85,6 +112,7 @@ class OverlayController(private val ctx: Context) {
     private var recognitionInfo: String? = null
     private var historyInfo: String? = null
     private var historyExpanded = false
+    private var missingContextExpanded = false
 
     /** Current title and sender mode, shown for on-device verification. */
     private var conversationTitle: String? = null
@@ -97,7 +125,9 @@ class OverlayController(private val ctx: Context) {
     private var historyPanelVisible = false
     private var historyImportStatus: String? = null
 
-    fun blocksAutoAnalysis(): Boolean = historyPanelVisible || choosingContact
+    fun blocksAutoAnalysis(): Boolean = historyPanelVisible || choosingContact || editingAdjustment
+
+    fun protectsAdjustment(): Boolean = editingAdjustment || android.os.SystemClock.elapsedRealtime() < adjustmentSettlesAt
 
     /** Whether the overlay window is currently on screen. */
     fun isShowing(): Boolean = root != null
@@ -112,7 +142,7 @@ class OverlayController(private val ctx: Context) {
     private fun dp(v: Int) = TypedValue.applyDimension(
         TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), ctx.resources.displayMetrics).roundToInt()
 
-    private fun canOverlay(): Boolean = Settings.canDrawOverlays(ctx)
+    private fun canOverlay(): Boolean = ctx is android.accessibilityservice.AccessibilityService || Settings.canDrawOverlays(ctx)
 
     private val screenW get() = ctx.resources.displayMetrics.widthPixels
     private val screenH get() = ctx.resources.displayMetrics.heightPixels
@@ -137,8 +167,15 @@ class OverlayController(private val ctx: Context) {
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            // Honor's Android 16 build returns an empty accessibility tree for
+            // WeChat while our overlay is TYPE_ACCESSIBILITY_OVERLAY. Prefer
+            // the 1.6.0 window type whenever the user granted draw-over-other-
+            // apps; keep the accessibility type only as a permission fallback.
+            if (Settings.canDrawOverlays(ctx))
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            else WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -148,6 +185,10 @@ class OverlayController(private val ctx: Context) {
         lp = params
 
         val r = FrameLayout(ctx)
+        r.setOnTouchListener { _, event ->
+            if (event.action == MotionEvent.ACTION_OUTSIDE) releaseAdjustmentFocus()
+            false
+        }
         val p = buildPanel()
         val bubbleWrap = buildBubble(params)
         r.addView(p)
@@ -178,7 +219,7 @@ class OverlayController(private val ctx: Context) {
             background = card(16, panelBg(), stroke = true)
             elevation = dp(10).toFloat()
             setPadding(dp(16), dp(13), dp(16), dp(13))
-            layoutParams = FrameLayout.LayoutParams(dp(320), FrameLayout.LayoutParams.WRAP_CONTENT).apply {
+            layoutParams = FrameLayout.LayoutParams(minOf(dp(320), screenW - dp(12)), FrameLayout.LayoutParams.WRAP_CONTENT).apply {
                 topMargin = dp(56) // sit just below the bubble
             }
         }
@@ -189,9 +230,39 @@ class OverlayController(private val ctx: Context) {
             setTypeface(typeface, Typeface.BOLD)
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
+        header.addView(ImageButton(ctx).apply {
+            setImageResource(android.R.drawable.ic_popup_sync)
+            contentDescription = "刷新 GalMagan"; tooltipText = "刷新 GalMagan"
+            imageTintList = android.content.res.ColorStateList.valueOf(Color.parseColor("#667085"))
+            background = card(8, Color.TRANSPARENT)
+            layoutParams = LinearLayout.LayoutParams(dp(40), dp(40))
+            setPadding(dp(9), dp(9), dp(9), dp(9))
+            setOnClickListener { onRefresh?.invoke() }
+        })
         header.addView(iconBtn("⚙") { openSettings() })
         header.addView(iconBtn("✕") { toggle() })
         p.addView(header)
+
+        directionPicker = Spinner(ctx).apply {
+            adapter = ArrayAdapter(ctx, android.R.layout.simple_spinner_dropdown_item, ChatDirection.entries.map { it.label })
+            contentDescription = "聊天方向"
+            minimumHeight = dp(44)
+            setSelection(selectedDirection.ordinal)
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                    val direction = ChatDirection.entries[position]
+                    if (direction != selectedDirection) {
+                        selectedDirection = direction
+                        onDirectionChanged?.invoke(direction)
+                    }
+                }
+                override fun onNothingSelected(parent: AdapterView<*>?) {}
+            }
+        }
+        p.addView(directionPicker)
+        stopAnalysisButton = smallAction("停止分析") { onStopAnalysis?.invoke() }.apply {
+            visibility = if (analysisBusy) View.VISIBLE else View.GONE
+        }.also { p.addView(it) }
 
         val scroll = ScrollView(ctx).apply {
             isVerticalScrollBarEnabled = false
@@ -203,9 +274,126 @@ class OverlayController(private val ctx: Context) {
         val content = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
         scroll.addView(content)
         p.addView(scroll)
+        analysisScroll = scroll
+        p.addView(buildAdjustmentControls())
         contentBox = content
         panel = p
         return p
+    }
+
+    private fun buildAdjustmentControls(): LinearLayout {
+        val box = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(8), 0, 0)
+            visibility = View.GONE
+        }
+        adjustmentCount = hint("补充说明／调整方向").also { box.addView(it) }
+        val row = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val editor = object : EditText(ctx) {
+            override fun onKeyPreIme(keyCode: Int, event: KeyEvent): Boolean {
+                if (keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) post { releaseAdjustmentFocus() }
+                return super.onKeyPreIme(keyCode, event)
+            }
+        }.apply {
+            hint = "例如：她在开玩笑；更简短一点"
+            textSize = 13f
+            setTextColor(Color.parseColor("#172230"))
+            setHintTextColor(Color.parseColor("#667085"))
+            background = card(8, Color.WHITE, stroke = true)
+            setPadding(dp(9), dp(8), dp(9), dp(8))
+            minLines = 1; maxLines = 3
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            filters = arrayOf(InputFilter.LengthFilter(1000))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            setOnTouchListener { _, event ->
+                if (event.action == MotionEvent.ACTION_DOWN && !analysisBusy) {
+                    setKeyboardActive(true)
+                    requestFocus()
+                    post { (ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showSoftInput(this, InputMethodManager.SHOW_IMPLICIT) }
+                }
+                false
+            }
+            onFocusChangeListener = View.OnFocusChangeListener { _, focused ->
+                editingAdjustment = focused
+                if (!focused) setKeyboardActive(false)
+            }
+        }
+        adjustmentEdit = editor
+        row.addView(editor)
+        fun action(icon: Int, description: String, click: () -> Unit) = ImageButton(ctx).apply {
+            setImageResource(icon)
+            contentDescription = description; tooltipText = description
+            imageTintList = android.content.res.ColorStateList.valueOf(Color.parseColor("#2F6BFF"))
+            background = card(8, Color.parseColor("#EEF4FF"))
+            layoutParams = LinearLayout.LayoutParams(dp(42), dp(42)).apply { leftMargin = dp(5) }
+            setOnClickListener { click() }
+        }
+        submitAdjustment = action(android.R.drawable.ic_menu_send, "提交补充并更新分析") {
+            val value = editor.text.toString().trim()
+            if (value.isBlank()) { toast("请先填写补充说明"); return@action }
+            releaseAdjustmentFocus()
+            onAdjustment?.invoke(value)
+        }.also { row.addView(it) }
+        clearAdjustments = action(android.R.drawable.ic_menu_close_clear_cancel, "清除本次调整并重新分析") {
+            editor.text.clear()
+            releaseAdjustmentFocus()
+            onClearAdjustments?.invoke()
+        }.also { row.addView(it) }
+        box.addView(row)
+        adjustmentControls = box
+        return box
+    }
+
+    private fun setKeyboardActive(active: Boolean) {
+        editingAdjustment = active
+        val params = lp ?: return
+        params.flags = if (active) params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+            else params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        params.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+        analysisScroll?.layoutParams?.let { size ->
+            size.height = if (active) minOf(dp(150), (screenH * 0.18f).roundToInt()) else (screenH * 0.40f).roundToInt()
+            analysisScroll?.layoutParams = size
+        }
+        root?.let { runCatching { wm.updateViewLayout(it, params) } }
+    }
+
+    fun releaseAdjustmentFocus() {
+        if (editingAdjustment) adjustmentSettlesAt = android.os.SystemClock.elapsedRealtime() + 900L
+        editingAdjustment = false
+        adjustmentEdit?.let {
+            (ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(it.windowToken, 0)
+            it.clearFocus()
+        }
+        setKeyboardActive(false)
+    }
+
+    fun cancelAnalysisUi(clearDraft: Boolean = false) {
+        releaseAdjustmentFocus()
+        setBusy(false)
+        lastFill = null
+        lastJudgment = null
+        adjustmentControls?.visibility = View.GONE
+        if (clearDraft) adjustmentEdit?.text?.clear()
+    }
+
+    fun setSessionAdjustments(turns: List<String>) {
+        if (turns != sessionAdjustments) adjustmentEdit?.text?.clear()
+        sessionAdjustments = turns.toList()
+        adjustmentCount?.text = "补充说明／调整方向 · 本次 ${turns.size} 轮"
+    }
+
+    fun setDirection(direction: ChatDirection) {
+        selectedDirection = direction
+        directionPicker?.setSelection(direction.ordinal)
+    }
+
+    private fun setBusy(busy: Boolean) {
+        analysisBusy = busy
+        stopAnalysisButton?.visibility = if (busy) View.VISIBLE else View.GONE
+        directionPicker?.isEnabled = !busy
+        adjustmentEdit?.isEnabled = !busy
+        submitAdjustment?.isEnabled = !busy
+        clearAdjustments?.isEnabled = !busy
     }
 
     private fun iconBtn(glyph: String, onClick: () -> Unit) = TextView(ctx).apply {
@@ -302,6 +490,7 @@ class OverlayController(private val ctx: Context) {
             panel?.visibility = View.VISIBLE
             bubble?.innerFilled = true
         } else {
+            releaseAdjustmentFocus()
             panel?.visibility = View.GONE
             params.x = collapsedX; params.y = collapsedY  // bubble returns to where it was
             bubble?.innerFilled = false
@@ -335,6 +524,10 @@ class OverlayController(private val ctx: Context) {
      * could fill the wrong chat's input box.
      */
     fun resetForNewConversation() {
+        releaseAdjustmentFocus()
+        setBusy(false)
+        adjustmentEdit?.text?.clear()
+        adjustmentControls?.visibility = View.GONE
         choosingContact = false
         recognitionInfo = null
         lastJudgment = null
@@ -359,15 +552,18 @@ class OverlayController(private val ctx: Context) {
     }
 
     fun showLoading(status: String = "分析中…") {
+        releaseAdjustmentFocus()
         historyPanelVisible = false
         choosingContact = false
         lastJudgment = null
         lastFill = null
         ensureRoot(); bubble?.alpha = 1f
+        setBusy(true)
         resetBubbleColor()
         ctxNotes = 0; ctxHistory = 0; ctxStyle = 0 // counts for the round that is starting
         historyInfo = null
         historyExpanded = false
+        missingContextExpanded = false
         replyError = null              // this round has not failed (yet)
         setContent(captureInfoViews() + listOf(hint(status)))
         if (!expanded) toggle()
@@ -530,10 +726,14 @@ class OverlayController(private val ctx: Context) {
         historyPanelVisible = false
         choosingContact = false
         ensureRoot(); bubble?.alpha = 1f
+        setBusy(false)
+        lastFill = null
+        adjustmentControls?.visibility = if (lastJudgment?.situation != null) View.VISIBLE else View.GONE
         resetBubbleColor()
         val views = captureInfoViews().toMutableList()
         views.add(line("出错了", "#DC2626", 14f, true))
         views.add(hint(msg))
+        views.add(copyErrorButton(msg))
         views.add(bigButton("重新分析当前对话") { onManualAnalyze?.invoke() })
         setContent(views)
         if (!expanded) toggle()
@@ -542,6 +742,20 @@ class OverlayController(private val ctx: Context) {
     fun showJudgment(a: Analysis) {
         lastJudgment = a
         render(a, generating = true)
+    }
+
+    fun showProgress(status: String) {
+        val analysis = lastJudgment
+        if (analysis == null) setContent(captureInfoViews() + listOf(hint(status)))
+        else render(analysis, generating = true, status = status)
+    }
+
+    fun showAnalysis(a: Analysis, onFill: (String) -> Unit) {
+        lastJudgment = a
+        lastFill = onFill
+        replyError = null
+        setBusy(false)
+        render(a, generating = false)
     }
 
     fun showReplies(ranked: List<RankedReply>, error: String? = null, onFill: (String) -> Unit) {
@@ -554,7 +768,31 @@ class OverlayController(private val ctx: Context) {
 
     fun toast(msg: String) = Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()
 
+    fun showStopped() {
+        ensureRoot()
+        setBusy(false)
+        lastFill = null
+        lastJudgment = null
+        resetBubbleColor()
+        adjustmentControls?.visibility = View.GONE
+        setContent(listOf(hint("本次分析已停止"), bigButton("重新分析当前对话") { onManualAnalyze?.invoke() }))
+        if (!expanded) toggle()
+    }
+
+    fun refresh(title: String?) {
+        hide()
+        resetForNewConversation()
+        historyPanelVisible = false
+        historyImportRunning = false
+        historyImportStatus = null
+        adjustmentSettlesAt = 0L
+        showIdle(title)
+        if (!expanded) toggle()
+        toast("已刷新，可重新分析当前对话")
+    }
+
     fun hide() {
+        releaseAdjustmentFocus()
         val r = root ?: return
         choosingContact = false
         runCatching { wm.removeView(r) }
@@ -568,7 +806,7 @@ class OverlayController(private val ctx: Context) {
         c.removeAllViews(); views.forEach { c.addView(it) }
     }
 
-    private fun render(a: Analysis, generating: Boolean) {
+    private fun render(a: Analysis, generating: Boolean, status: String = "生成中…") {
         ensureRoot(); bubble?.alpha = 1f
         // Each analysis starts from the neutral color. Continuation analyses
         // have no danger score and must not inherit the previous warning color.
@@ -603,7 +841,33 @@ class OverlayController(private val ctx: Context) {
             }
         }
 
-        if (a.continuation) {
+        val situation = a.situation
+        if (situation != null) {
+            views.add(dangerBadge(situation.riskLevel, 9))
+            tintBubbleDanger(situation.riskLevel.toDouble())
+            views.add(line(situation.topic, "#172230", 15f, true))
+            fun detail(title: String, entries: List<String>) {
+                if (entries.isNotEmpty()) {
+                    views.add(line(title, "#344054", 12f, true))
+                    views.add(hint(entries.joinToString("\n") { "· $it" }))
+                }
+            }
+            detail("尚未解决", situation.unresolved)
+            detail("可能的情绪与诉求（推测）", situation.interpretations)
+            if (situation.missingContext.isNotEmpty()) {
+                views.add(smallAction(if (missingContextExpanded) "收起仍缺少的背景" else "仍缺少的背景 · ${situation.missingContext.size} 项") {
+                    missingContextExpanded = !missingContextExpanded
+                    lastJudgment?.let { render(it, generating, status) }
+                })
+                if (missingContextExpanded) views.add(hint(situation.missingContext.joinToString("\n") { "· $it" }))
+            }
+            views.add(hint("风险依据：${situation.riskReason}"))
+            views.add(line("回复目标：${situation.strategy.goal}", "#172230", 14f, true))
+            detail("建议表达", situation.strategy.actions)
+            detail("注意事项", situation.strategy.cautions)
+            detail("本次事实纠正", situation.correctedFacts)
+            detail("本次表达偏好", situation.expressionPreferences)
+        } else if (a.continuation) {
             views.add(hint("最近一条是我发出的；这里只生成接着当前话题的下一句"))
         } else {
             a.dangerLevel?.let {
@@ -613,7 +877,6 @@ class OverlayController(private val ctx: Context) {
             }
             a.trueIntent?.let {
                 views.add(line("对方真实意图：${INTENT[it.choice] ?: it.choice}", "#111827", 15f, true))
-                views.add(hint("把握 ${(it.confidence * 100).roundToInt()}%"))
             }
             val bits = ArrayList<String>()
             a.sheNeeds?.let { bits.add("要${(NEEDS[it.choice] ?: it.choice)}") }
@@ -624,20 +887,24 @@ class OverlayController(private val ctx: Context) {
         }
 
         views.add(divider())
-        views.add(line(if (a.continuation) "接着当前话题" else "候选回复（模型排序）", "#9CA3AF", 12f))
+        views.add(line("候选回复", "#667085", 12f))
         if (generating) {
-            views.add(hint("生成中…"))
+            views.add(hint(status))
         } else {
             val fill = lastFill ?: {}
             a.rankedReplies.forEachIndexed { i, r ->
-                views.add(replyCard(i + 1, r.text, (r.prob * 100).roundToInt(), fill))
+                views.add(replyCard(i + 1, r.text, r.approach, fill))
             }
             if (a.rankedReplies.isEmpty()) {
                 val msg = replyError?.let { "回复接口出错：$it" } ?: "（未生成候选回复）"
                 views.add(hint(msg))
             }
         }
-        views.add(reAnalyzeBtn())
+        if (a.reviewSummary.isNotBlank()) views.add(hint("候选检查：${a.reviewSummary}"))
+        if (sessionAdjustments.isNotEmpty()) views.add(hint("本次补充（不写入聊天历史）：\n" +
+            sessionAdjustments.mapIndexed { i, text -> "${i + 1}. $text" }.joinToString("\n")))
+        if (!generating) views.add(reAnalyzeBtn())
+        adjustmentControls?.visibility = if (situation != null && !generating) View.VISIBLE else View.GONE
 
         setContent(views)
         if (!expanded) toggle()
@@ -662,7 +929,7 @@ class OverlayController(private val ctx: Context) {
         return row
     }
 
-    private fun replyCard(rank: Int, text: String, pct: Int, onFill: (String) -> Unit): View {
+    private fun replyCard(rank: Int, text: String, approach: String, onFill: (String) -> Unit): View {
         val top = rank == 1
         val cardBg = if (top) Color.parseColor("#EEF4FF") else Color.parseColor("#F5F7FA")
         val c = LinearLayout(ctx).apply {
@@ -674,7 +941,8 @@ class OverlayController(private val ctx: Context) {
             ).apply { topMargin = dp(6) }
         }
         c.addView(TextView(ctx).apply {
-            this.text = "#$rank · ${pct}%"; setTextColor(Color.parseColor("#2F6BFF")); textSize = 11f
+            this.text = if (approach.isBlank()) "候选 $rank" else "候选 $rank · $approach"
+            setTextColor(Color.parseColor("#2F6BFF")); textSize = 11f
             setTypeface(typeface, Typeface.BOLD)
         })
         c.addView(TextView(ctx).apply {
@@ -684,7 +952,11 @@ class OverlayController(private val ctx: Context) {
         val btns = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
         btns.addView(pill("复制", false) { copy(text) })
         // Fill, then collapse so the input box + keyboard are visible to review/send.
-        btns.addView(pill("填入", true) { android.util.Log.d("JEVASSIST", "overlay: fill tapped"); onFill(text); if (expanded) toggle() })
+        btns.addView(pill("填入", true) {
+            releaseAdjustmentFocus()
+            if (expanded) toggle()
+            onFill(text)
+        })
         c.addView(btns)
         return c
     }
@@ -835,6 +1107,21 @@ class OverlayController(private val ctx: Context) {
         }
 
     private fun hint(text: String) = line(text, "#667085", 12f)
+
+    private fun copyErrorButton(message: String) = TextView(ctx).apply {
+        text = "复制错误信息"
+        contentDescription = "复制完整错误信息到剪贴板"
+        textSize = 13f
+        gravity = Gravity.CENTER
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(Color.parseColor("#2F6BFF"))
+        background = card(8, Color.WHITE, stroke = true)
+        setPadding(dp(12), dp(9), dp(12), dp(9))
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(6) }
+        setOnClickListener { copy(message) }
+    }
 
     private fun divider() = View(ctx).apply {
         setBackgroundColor(Color.parseColor("#DDE4EE"))

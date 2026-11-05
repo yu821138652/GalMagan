@@ -71,7 +71,7 @@ class MainActivity : AppCompatActivity() {
 
         val a11y = isA11yEnabled()
         val overlay = Settings.canDrawOverlays(this)
-        val key = prefs.hasKey()   // judge route key: the one analysis cannot run without
+        val key = prefs.hasKey()
         val ready = a11y && overlay && key
 
         // Readiness card
@@ -150,7 +150,7 @@ class MainActivity : AppCompatActivity() {
         c.addView(head)
         c.addView(checkLine("无障碍", a11y))
         c.addView(checkLine("悬浮窗", overlay))
-        c.addView(checkLine("密钥", key, okWord = "已设", noWord = "未设"))
+        c.addView(checkLine("通用模型接口", key, okWord = "已配置", noWord = "待配置"))
         // History recording is opt-in (off by default). Mention it here, never block on it.
         if (!prefs.contextEnabled) {
             c.addView(text("关联上下文未开启，可在设置里开启", 12f, sub).apply {

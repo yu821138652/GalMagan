@@ -154,14 +154,76 @@ private fun readChatNodes(root: AccessibilityNodeInfo): List<ChatTreeReader.Node
     return nodes
 }
 
+/**
+ * Some Android/OEM builds return a valid WeChat root but no children from the
+ * first tree walk. The message container can still be queried by its stable
+ * resource id through the accessibility provider. Keep this fallback narrow:
+ * it only asks for the known message id.
+ */
+private fun readQueriedWeChatNodes(
+    root: AccessibilityNodeInfo,
+    width: Int,
+    height: Int
+): List<ChatTreeReader.Node> {
+    val result = ArrayList<ChatTreeReader.Node>()
+    val seen = HashSet<String>()
+    val queried = runCatching {
+        root.findAccessibilityNodeInfosByViewId("com.tencent.mm:id/bkl")
+    }.getOrDefault(emptyList())
+    queried.forEach { node ->
+        val b = Rect()
+        node.getBoundsInScreen(b)
+        if (b.width() <= 0 || b.height() <= 0 || b.bottom <= 0 || b.top >= height ||
+            b.right <= 0 || b.left >= width
+        ) return@forEach
+        val text = node.text?.toString().orEmpty()
+        val description = node.contentDescription?.toString().orEmpty()
+        val key = "$text\u001f$description\u001f${b.left},${b.top},${b.right},${b.bottom}"
+        if (!seen.add(key)) return@forEach
+        // The direct bkl query is already scoped to the message container. A
+        // valid screen rectangle is a safer visibility fallback than trusting
+        // the stale visibility bit from the empty provider root.
+        result.add(ChatTreeReader.Node(
+            parent = 0,
+            id = "com.tencent.mm:id/bkl",
+            text = text,
+            description = description,
+            className = node.className?.toString().orEmpty(),
+            left = b.left,
+            top = b.top,
+            right = b.right,
+            bottom = b.bottom,
+            editable = node.isEditable,
+            visible = true
+        ))
+    }
+    return result
+}
+
 class WeChatAdapter : ChatAppAdapter {
     override val pkg = "com.tencent.mm"
     var lastDiagnostic: String = "微信无障碍：尚未读取"
         private set
 
     override fun extract(root: AccessibilityNodeInfo, res: Resources): ChatSnapshot? {
-        val result = ChatTreeReader.read(readChatNodes(root), res.displayMetrics.widthPixels, res.displayMetrics.heightPixels)
-        lastDiagnostic = result.diagnostic
+        // Refresh an empty provider root once before trying the ID query.
+        if (root.childCount == 0) runCatching { root.refresh() }
+        val width = res.displayMetrics.widthPixels
+        val height = res.displayMetrics.heightPixels
+        val direct = readChatNodes(root)
+        val queried = if (direct.size <= 1 || direct.none { it.id == "com.tencent.mm:id/bkl" })
+            readQueriedWeChatNodes(root, width, height) else emptyList()
+        val result = ChatTreeReader.read(direct + queried, width, height)
+        lastDiagnostic = "${result.diagnostic} · 直接遍历 ${direct.size} · 资源查询 ${queried.size}"
+        if (result.messages.isEmpty()) {
+            // Structure only: diagnostics must not expose message or draft text.
+            val structure = direct.take(8).mapIndexed { i, n ->
+                "#$i ${n.className.substringAfterLast('.')} 子${direct.count { it.parent == i }} " +
+                    "可见${n.visible} 文字${n.text.length} 描述${n.description.length} " +
+                    "[${n.left},${n.top},${n.right},${n.bottom}]"
+            }.joinToString("; ")
+            lastDiagnostic += "\n节点结构：$structure"
+        }
         if (!result.inChat) return null
         val rects = result.messages.map {
             BubbleRect(Rect(it.node.left, it.node.top, it.node.right, it.node.bottom), it.side)

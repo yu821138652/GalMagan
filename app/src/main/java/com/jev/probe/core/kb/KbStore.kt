@@ -192,29 +192,8 @@ class KbStore private constructor(context: Context) {
 
     // ---------------------------------------------------------------- history
 
-    /**
-     * Append one screenful of messages, keeping only the newest [MAX_LOG].
-     *
-     * The unit is a SEQUENCE, not a set of lines. A capture gives us the whole
-     * visible screen S, top to bottom; P is whatever screen we last wrote for
-     * this contact. Two identical short lines on one screen are two positions and
-     * get two entries — they are not folded together, and nothing is dropped for
-     * being "too short to dedupe on" or for having been said before.
-     *
-     * The rules, in order:
-     *  - S equals P            → the same screen again, write nothing.
-     *  - log is empty          → write all of S.
-     *  - log tail matches the first k lines of S (k > 0) → the screen scrolled by
-     *    (S.size - k) lines; append only that new tail.
-     *  - k is 0 and S shares nothing with P → the user scrolled up into old
-     *    messages we already hold; this round writes nothing rather than
-     *    duplicating history at the end of the file.
-     *  - anything else         → append all of S.
-     *
-     * @param screenBatch true for a capture (the rules above). False for a
-     *        deliberate single-entry injection that is NOT a screen read, which
-     *        is appended as-is.
-     */
+    /** Append a confirmed latest screen, preserving repeated messages as positions.
+     * Older pages belong to [prependLog], never to the automatic update path. */
     fun appendLog(contactId: String, entries: List<LogEntry>, screenBatch: Boolean = true): Boolean {
         return synchronized(lock) {
             entries.groupBy { it.app }.map { (environment, batch) ->
@@ -242,38 +221,31 @@ class KbStore private constructor(context: Context) {
                 return true
             }
 
-            // How much of S the log already ends with.
-            var k = 0
-            val maxK = minOf(list.size, keys.size)
-            for (cand in maxK downTo 1) {
-                var match = true
-                for (i in 0 until cand) {
-                    val e = list[list.size - cand + i]
-                    if (key(e.side, e.text) != keys[i]) { match = false; break }
-                }
-                if (match) { k = cand; break }
-            }
+            val existingKeys = list.map { key(it.side, it.text) }
+            val sourceMatch = forwardMatch(prev, keys)
+            val storedMatch = forwardMatch(existingKeys, keys)
+            val k = storedMatch.first
 
             val tail: List<LogEntry> = when {
                 !screenBatch -> screen
+                prev.isNotEmpty() && containsSequence(prev, keys) -> emptyList()
                 // A manual edit changes the stored text, but not the source
                 // screen. Compare against that screen to keep corrections.
-                screenBatch && prev.isNotEmpty() && screenOverlap(prev, keys) > 0 ->
-                    screen.drop(screenOverlap(prev, keys))
+                sourceMatch.first > 0 && sourceMatch.second == 0 -> screen.drop(sourceMatch.first)
+                storedMatch.first > 0 -> {
+                    // A larger viewport may reveal rows before the old tail.
+                    // Place those rows at that anchor, then append only newer rows.
+                    val boundary = list.size - storedMatch.first
+                    mergeBefore(list, boundary, screen.take(storedMatch.second))
+                    screen.drop(storedMatch.second + storedMatch.first)
+                }
+                sourceMatch.first > 0 -> screen.drop(sourceMatch.second + sourceMatch.first)
                 list.isEmpty() -> screen
-                k > 0 -> screen.drop(k)
-                // Nothing in common with the screen we last wrote → we are looking
-                // at older messages, not newer ones. Leave the log alone.
-                prev.isNotEmpty() && keys.none { it in prev } -> {
-                    Log.d(TAG, "appendLog contact=$contactId skipped: scrolled off the last screen")
-                    return true
-                }
-                else -> {
-                    val known = list.map { key(it.side, it.text) }.toHashSet()
-                    screen.filter { key(it.side, it.text) !in known }
-                }
+                // The caller confirmed the bottom of the chat. A disconnected
+                // screen is newer, even after a long interval without captures.
+                else -> screen
             }
-            if (tail.isEmpty()) {
+            if (tail.isEmpty() && list.map { key(it.side, it.text) } == existingKeys) {
                 if (screenBatch) saveLastScreen(contactId, environment, keys)
                 return true
             }
@@ -325,19 +297,19 @@ class KbStore private constructor(context: Context) {
     }
 
     /**
-     * Insert an older screen before the retained history. Used by the manual
-     * history pre-collector, which scrolls upward instead of toward newer data.
-     * The overlapping suffix/prefix is kept only once.
+     * Insert a backward page immediately before its newer neighbouring page.
+     * The neighbour can be in the middle of retained history while filling a gap.
+     * An unanchored page must be recaptured with some visible overlap.
      */
-    fun prependLog(contactId: String, entries: List<LogEntry>): Boolean {
+    fun prependLog(contactId: String, entries: List<LogEntry>, newerPage: List<LogEntry> = emptyList()): Boolean {
         return synchronized(lock) {
             entries.groupBy { it.app }.map { (environment, batch) ->
-                prependEnvironment(contactId, environment, batch)
+                prependEnvironment(contactId, environment, batch, newerPage.filter { it.app == environment })
             }.all { it }
         }
     }
 
-    private fun prependEnvironment(contactId: String, environment: String, entries: List<LogEntry>): Boolean {
+    private fun prependEnvironment(contactId: String, environment: String, entries: List<LogEntry>, newerPage: List<LogEntry>): Boolean {
         if (entries.isEmpty()) return true
         synchronized(lock) {
             val screen = entries.filter { it.text.isNotBlank() }
@@ -348,19 +320,18 @@ class KbStore private constructor(context: Context) {
             } else {
                 val existingKeys = list.map { key(it.side, it.text) }
                 val incomingKeys = screen.map { key(it.side, it.text) }
-                if (containsSequence(existingKeys, incomingKeys)) return true
-                var overlap = 0
-                val max = minOf(existingKeys.size, incomingKeys.size)
-                for (candidate in max downTo 1) {
-                    if (incomingKeys.takeLast(candidate) == existingKeys.take(candidate)) {
-                        overlap = candidate
-                        break
-                    }
+                val nextKeys = newerPage.map { key(it.side, it.text) }
+                val boundary = if (nextKeys.isEmpty()) 0 else
+                    (0..(existingKeys.size - nextKeys.size).coerceAtLeast(-1)).lastOrNull {
+                        existingKeys.subList(it, it + nextKeys.size) == nextKeys
+                    } ?: throw IllegalArgumentException("上一页定位已变化，请从最新消息重新开始预加载")
+                val overlap = screenOverlap(incomingKeys, if (nextKeys.isEmpty()) existingKeys else nextKeys)
+                if (overlap == 0) {
+                    if (containsSequence(existingKeys.take(boundary), incomingKeys)) return true
+                    throw IllegalArgumentException("未找到与上一页的重叠，请向下回退一些，保留部分重叠消息后继续")
                 }
-                val known = existingKeys.toHashSet()
-                val older = if (overlap > 0) screen.dropLast(overlap)
-                    else screen.filter { key(it.side, it.text) !in known }
-                if (older.isNotEmpty()) list.addAll(0, older)
+                val older = screen.dropLast(overlap)
+                mergeBefore(list, boundary, older)
             }
             while (list.size > MAX_LOG) list.removeAt(0)
             val ok = saveEnvironment(contactId, environment, list)
@@ -400,6 +371,26 @@ class KbStore private constructor(context: Context) {
         (minOf(previous.size, current.size) downTo 1).firstOrNull {
             previous.takeLast(it) == current.take(it)
         } ?: 0
+
+    private fun mergeBefore(list: MutableList<LogEntry>, boundary: Int, older: List<LogEntry>) {
+        val prefix = list.take(boundary).map { key(it.side, it.text) }
+        val incoming = older.map { key(it.side, it.text) }
+        val forward = screenOverlap(prefix, incoming)
+        val backward = screenOverlap(incoming, prefix)
+        if (backward > forward) list.addAll(0, older.dropLast(backward))
+        else list.addAll(boundary, older.drop(forward))
+    }
+
+    /** Largest saved suffix contained in a later visible page, plus its start. */
+    private fun forwardMatch(previous: List<String>, current: List<String>): Pair<Int, Int> {
+        for (size in minOf(previous.size, current.size) downTo 1) {
+            val suffix = previous.takeLast(size)
+            for (start in 0..current.size - size) {
+                if (current.subList(start, start + size) == suffix) return size to start
+            }
+        }
+        return 0 to 0
+    }
 
     fun historyEnvironments(contactId: String): List<String> = synchronized(lock) {
         loadLog(contactId).map { it.app }.distinct()

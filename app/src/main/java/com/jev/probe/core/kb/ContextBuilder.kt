@@ -27,9 +27,6 @@ object ContextBuilder {
     /** Only the last few messages are searched for note keywords. */
     private const val MATCH_WINDOW = 6
 
-    /** Identical on-screen copies this short are not worth de-duplicating. */
-    private const val DEDUPE_MIN_LEN = 4
-
     /**
      * @param app package name of the foreground chat app (may be blank).
      * @return context for this snapshot; every field may be empty, which is the
@@ -40,19 +37,21 @@ object ContextBuilder {
         snapshot: ChatSnapshot,
         app: String,
         prefs: Prefs,
-        useContactHistory: Boolean = true
+        useContactHistory: Boolean = true,
+        selectedContactId: String? = null
     ): ChatContext {
         val store = KbStore.get(context)
         val title = snapshot.title ?: ""
 
         // 1. Contact — matched only, never created here.
-        val contact = if (useContactHistory) store.findContact(title, app) else null
+        val contact = if (!useContactHistory) null
+            else if (selectedContactId != null) store.contact(selectedContactId) else store.findContact(title, app)
 
         // 2. History — recorded and injected only with the user's opt-in.
         // Selected contact identity scopes a local history log. Do not let a
         // legacy opt-in toggle silently prevent history from being sent.
         val history = if (contact != null)
-            historyFor(store, contact, snapshot, prefs) else emptyList()
+            historyFor(store, contact, snapshot, app, prefs) else emptyList()
 
         // 3. Notes — always-on ones plus keyword hits.
         val enabled = store.notes().filter { it.enabled }
@@ -77,10 +76,12 @@ object ContextBuilder {
     }
 
     /** Persist a newly recognized visible window immediately, before analysis. */
-    fun recordVisible(context: Context, snapshot: ChatSnapshot, app: String): Contact? {
-        if (snapshot.messages.isEmpty()) return null
+    fun recordVisible(context: Context, snapshot: ChatSnapshot, app: String, selectedContactId: String? = null): Contact? {
+        if (snapshot.messages.isEmpty() || !snapshot.atLatest) return null
         val store = KbStore.get(context)
-        val contact = store.findContact(snapshot.title.orEmpty(), app) ?: return null
+        val contact = if (selectedContactId != null) store.contact(selectedContactId)
+            else store.findContact(snapshot.title.orEmpty(), app)
+        contact ?: return null
         store.appendLog(contact.id, snapshot.messages.map {
             LogEntry(it.side, it.text, 0L, app)
         })
@@ -88,34 +89,36 @@ object ContextBuilder {
     }
 
     private fun styleFor(store: KbStore, contact: Contact?): StyleProfile? {
-        val profile = contact?.let { store.styleProfile(it.id) } ?: store.styleProfile(null)
+        val profile = contact?.let { store.styleProfile(it.id)?.takeIf { profile -> !profile.isEmpty() } }
+            ?: store.styleProfile(null)
         return profile?.takeIf { !it.isEmpty() }
     }
 
-    /**
-     * Record the visible messages, then read back the recent window minus the
-     * copies already on screen (only for lines long enough that an exact repeat
-     * is certainly the same message).
-     */
+    /** Remove only the saved tail overlapping this screen, preserving earlier repeats. */
     private fun historyFor(
         store: KbStore,
         contact: Contact,
         snapshot: ChatSnapshot,
+        app: String,
         prefs: Prefs
     ): List<LogEntry> {
         val n = prefs.contextHistoryCount.coerceIn(0, 100)
         if (n == 0) return emptyList()
-        val onScreen = snapshot.messages
-            .filter { it.text.length >= DEDUPE_MIN_LEN }
-            .map { it.side + " " + it.text }
-            .toHashSet()
+        val environmentHistory = store.allLog(contact.id, app)
+        val visibleKeys = snapshot.messages.map { it.side to it.text }
+        val storedKeys = environmentHistory.map { it.side to it.text }
+        val overlap = (minOf(storedKeys.size, visibleKeys.size) downTo 1).firstOrNull { count ->
+            val tail = storedKeys.takeLast(count)
+            (0..visibleKeys.size - count).any { start -> visibleKeys.subList(start, start + count) == tail }
+        } ?: 0
+        val onScreenIds = environmentHistory.takeLast(overlap).map { it.id }.toHashSet()
         // Filter the widest window FIRST, then take n. The other order lets the
         // messages currently on screen eat into the quota — ask for 30 lines of
         // history, get 30 minus however many are already visible.
         // Storage remains isolated by contact + app, but analysis intentionally
         // sees this person's recent history across all chat environments.
         return store.recentLog(contact.id, KbStore.MAX_LOG, null)
-            .filter { (it.side + " " + it.text) !in onScreen }
+            .filter { it.id !in onScreenIds }
             .takeLast(n)
     }
 
