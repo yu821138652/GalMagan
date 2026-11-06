@@ -15,8 +15,8 @@
     <tr>
       <th>版本</th>
       <th>标签</th>
-      <th>相较前一稳定版本新增的功能</th>
-      <th>重大修复与验证</th>
+      <th>新增功能</th>
+      <th>修复</th>
     </tr>
   </thead>
   <tbody>
@@ -24,7 +24,7 @@
       <td><strong>2.0.8（当前）</strong></td>
       <td><a href="https://github.com/yu821138652/GalMagan/tree/v2.0.8"><code>v2.0.8</code></a></td>
       <td>相较 <code>1.6.4</code>：<br />• 默认分析改用通用模型，Jev 不再是必需项。<br />• 将分析、回复策略、候选生成和候选检查改为有依赖的顺序流程。<br />• 新增聊天方向选择和本次分析内的多轮补充。<br />• 新增停止分析和悬浮窗刷新操作。<br />• 改进历史预加载顺序锚定、重复过滤及编辑时的位置保持。</td>
-      <td>修复悬浮窗使用 <code>TYPE_ACCESSIBILITY_OVERLAY</code> 导致微信无障碍节点树为空的问题；已授予普通悬浮窗权限时改用 <code>TYPE_APPLICATION_OVERLAY</code>。已在荣耀 Magic7、Android 16、微信 8.0.80 验证可以读取聊天消息。117 项测试中 116 项通过，1 项需真实模型凭据的评估跳过。详见 <a href="docs/releases/2.0.8.md">2.0.8 版本记录</a>。</td>
+      <td>修复悬浮窗使用 <code>TYPE_ACCESSIBILITY_OVERLAY</code> 导致微信无障碍节点树为空的问题；已授予普通悬浮窗权限时改用 <code>TYPE_APPLICATION_OVERLAY</code>。已在荣耀 Magic7、Android 16、微信 8.0.80 验证可以读取聊天消息。详见 <a href="docs/releases/2.0.8.md">2.0.8 版本记录</a>。</td>
     </tr>
     <tr>
       <td><strong>1.6.4</strong></td>
