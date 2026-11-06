@@ -8,8 +8,8 @@
   <colgroup>
     <col width="8%" />
     <col width="12%" />
-    <col width="60%" />
-    <col width="20%" />
+    <col width="55%" />
+    <col width="25%" />
   </colgroup>
   <thead>
     <tr>
